@@ -30,6 +30,7 @@ export const startApiServer = async ({
       LANCEDB_PATH: join(tempRoot, '.lancedb'),
       UPLOADS_DIR: join(tempRoot, '.uploads'),
       COLLECTIONS_PATH: join(tempRoot, '.collections.json'),
+      INGEST_JOBS_PATH: join(tempRoot, 'ingest-jobs.json'),
       GENERATION_CONFIG_PATH: join(tempRoot, 'generation.json'),
       MASTER_PROMPTS_PATH: join(tempRoot, 'master-prompts.json'),
       OBSIDIAN_CONFIG_PATH: join(tempRoot, 'obsidian.json'),

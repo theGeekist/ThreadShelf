@@ -1,10 +1,11 @@
 # Architecture
 
 ThreadShelf is intentionally small: one Node.js server, reusable core modules,
-local embedding, local vector storage, and a React browser UI.
+local embedding by default, local vector storage, and a React browser UI.
 
 Conversation generation is an optional layer on top of the archive. The
-`llama.cpp` path is local; the explicitly selected OpenRouter path is external.
+`llama.cpp` path is local; OpenRouter and the optional Cloudflare embedding
+provider send the configured request content off-device.
 
 ## High-Level Flow
 
@@ -13,7 +14,7 @@ Export folder
   -> src/ingest.ts
   -> src/parser.ts
   -> src/chunking.ts
-  -> src/embedding.ts
+  -> src/embedding.ts (local MiniLM by default; optional Cloudflare BGE-M3)
   -> src/store.ts
   -> LanceDB
   -> src/server.ts API
@@ -80,21 +81,31 @@ Native chat tool call -> write policy + vault boundary -> create/edit OR browser
   retain their locally continued branch. Rewritten positional keys fork safely.
 - Files that parse to zero conversations are skipped (reported in `skippedFiles`)
   and never remove archived rows, including in watch mode.
-- `clearFirst` stages the complete folder before publication. Invalid or empty
-  files, embedding failures, or cancellation before the archive commit preserve
-  the previous collection and report `replacementSkipped`; staging requires
-  memory proportional to the folder. Progress events carry per-batch
-  `embeddingDone`/`embeddingTotal` and `progressPercent`.
+- `clearFirst` parses and validates the complete folder before publication.
+  Invalid or empty files, or cancellation before the archive commit, preserve
+  the previous collection and report `replacementSkipped`. After publication,
+  the reset marker hides the collection while vectors are streamed in batches;
+  interruption leaves a durable recovery job. Parsed turns are still staged in
+  memory for `clearFirst`, while chunk and vector memory is bounded by the model
+  batch limits. Progress reports committed chunk batches.
 
 Archive/index recovery (`src/store.ts`):
 
-- Replacements use atomic LanceDB merges, rather than separate delete/add calls.
 - Archive turns and their `indexPending` job commit together. The index is a
   recoverable projection: `local` refreshes locally authored chunks, `all`
   rebuilds a file, `delete` removes a tombstone, and `reset` rebuilds a collection.
-- Embedding runs outside the global `__threads` lock. Writers take a snapshot,
-  embed, then re-read the scope under the lock and commit only if it is unchanged
-  (up to 3 attempts), so imports never block unrelated chat saves.
+- Embedding runs outside the global `__threads` lock. A lazy chunk iterator uses
+  the active embedding tokenizer and context limit to split overlong chunks.
+  Object-mode stream buffers are bounded; each model batch is limited by
+  `EMBED_BATCH_SIZE` and the padded-token budget `EMBED_BATCH_TOKEN_BUDGET`.
+  Inference can overlap LanceDB writes, with ordinary stream backpressure only
+  when the storage sink falls behind. The pending marker hides the affected file
+  or collection until every batch is committed. Writers re-read the archive under
+  the lock before acknowledging and retry if it changed, so imports never block
+  unrelated chat saves.
+- If a batch fails or indexing is interrupted after publication, some vectors
+  may have been deleted or committed. The durable pending marker keeps that
+  scope out of search while recovery rebuilds it from archived turns.
 - A disconnect after archive publication does not interrupt the index commit.
   An index failure retains the durable job with `indexAttempts`, `indexRetryAt`
   and `indexError`; workers in the HTTP server, MCP server and CLIs retry with
@@ -127,6 +138,8 @@ Archive/index recovery (`src/store.ts`):
 `src/embedding.ts`
 
 - Loads the local multilingual Xenova embedding model.
+- Exposes the active tokenizer and context bound so ingestion avoids silent
+  truncation and sizes padded model batches by token slots.
 - Produces vectors for chunks and search queries.
 
 `src/store.ts`

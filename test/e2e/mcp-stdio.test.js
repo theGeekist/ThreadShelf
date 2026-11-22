@@ -106,14 +106,18 @@ describe('MCP stdio E2E', () => {
         assert.ok(Array.isArray(tools.result.tools));
         const toolNames = tools.result.tools.map((tool) => tool.name).sort();
         assert.deepStrictEqual(toolNames, [
-          'get_stats',
+          'export_thread_markdown',
+      'get_stats',
+      'import_queue_status',
           'list_collections',
           'list_files',
+      'list_thread_attachments',
           'obsidian_create',
           'obsidian_edit',
           'obsidian_read',
           'obsidian_search',
           'read_thread',
+      'read_thread_image',
           'search',
         ]);
 

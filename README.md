@@ -13,10 +13,15 @@ thread, and continue it with a local GGUF model through `llama.cpp` or the
 explicitly external OpenRouter provider.
 
 The archive pipeline—parsing, embeddings, LanceDB storage, search, HTTP API, and
-MCP—runs locally. Conversation generation is optional:
+MCP—runs locally by default. Cloudflare Workers AI embeddings are an explicit
+external option. Conversation generation is optional:
 `llama.cpp` stays loopback-only; switching to the clearly marked
 **OpenRouter · external** provider sends the selected user/assistant context and
 new prompt off-device.
+
+Selecting Cloudflare embeddings sends chunk text and search queries to Cloudflare
+Workers AI. Local MiniLM remains the default; Cloudflare embeddings use a separate
+index. See [Cloudflare embeddings](docs/CLOUDFLARE_EMBEDDINGS.md).
 
 ![ThreadShelf indexing, search, and thread workflow](docs/assets/threadshelf-demo.gif)
 
@@ -39,8 +44,9 @@ new prompt off-device.
 ## What it does (in 30 seconds)
 
 1. You export/copy your chats as JSON (see [Get your data](#get-your-data)).
-2. ThreadShelf parses them into a common format, embeds them **locally**, and
-   stores them in a local vector database (LanceDB).
+2. ThreadShelf parses them into a common format, embeds them locally by default,
+   and stores them in a local vector database (LanceDB). Cloudflare Workers AI is
+   available as an explicit external embedding provider.
 3. You search by meaning in the web UI, open the full original thread, and export
    any conversation to Markdown — or query the same index from an MCP client.
 4. Optionally start a new chat or continue an archived thread through local
@@ -437,9 +443,10 @@ Then in the browser:
 5. **Click a result** to open the full source thread; copy or export to
    Markdown or JSON.
 
-Use **Stop indexing** to cancel an active run. The current embedding batch is
-allowed to finish safely; completed files stay indexed and an uncommitted file
-keeps its previous index rows.
+Use **Stop indexing** to cancel an active run. An in-flight model call may
+finish; completed files stay searchable. While a file is being rebuilt, its old
+vectors are hidden from search. If indexing stops, the saved archive drives
+automatic recovery before that file becomes searchable again.
 
 > First indexing is slow while the local embedding model downloads once, then it's
 > cached. Working on the UI? `npm run dev` (backend) + `npm run dev:client` (Vite
@@ -796,6 +803,7 @@ CI runs the full gate on Linux and lightweight core checks on Windows.
 | `npm run parse -- <file> -- [flags]`                 | Parse one export file (`--no-user`, `--no-thinking`, `--no-ai`).                    |
 | `npm run ingest -- <folder> [collection] -- [flags]` | Ingest a folder (`--clear`, `--watch`, `--debounce <ms>`).                          |
 | `npm run search -- "<query>" -- [flags]`             | Search from the CLI (`--mode keyword`, `--collection`, `--roles`, `--n`, `--json`). |
+| `npm run bench:ingest-stream`                        | Compare synthetic whole-array and streaming ingest time and memory.                 |
 | `npm run setup:llama`                                | Discover local `llama-server`; add `-- -- --check` or explicit install flags.       |
 | `npm run build:package`                              | Build the publishable package (client UI + compiled server into `dist/`).           |
 | `npm run pack:verify`                                | Pack the tarball, install it in a temp dir, and boot it (`npx` smoke test).          |
@@ -804,43 +812,47 @@ Missing Playwright browsers? `npx playwright install chromium`.
 
 ## Configuration (optional env vars)
 
-| Variable                                  | Default                            | Purpose                                                               |
-| ----------------------------------------- | ---------------------------------- | --------------------------------------------------------------------- |
-| `PORT`                                    | `3000`                             | Server port.                                                          |
-| `HOST`                                    | `127.0.0.1`                        | Server host. Set explicitly only when trusted LAN access is required. |
-| `ALLOWED_HOSTS`                           | _(empty)_                          | Comma-separated extra Host/Origin names for trusted LAN access.       |
-| `THREADSHELF_DATA_DIR`                    | _(see Quick Start)_                | Root for all persistent data. Overrides the per-user default.         |
-| `LANCEDB_PATH`                            | _(data dir)_                       | LanceDB directory.                                                    |
-| `UPLOADS_DIR`                             | _(data dir)_                       | Uploaded source files.                                                |
-| `COLLECTIONS_PATH`                        | _(data dir)_                       | Manual-collections registry file.                                     |
-| `CHUNK_MAX_CHARS`                         | `2000`                             | Max characters per embedded chunk.                                    |
-| `CHUNK_OVERLAP_CHARS`                     | `100`                              | Overlap between long chunks.                                          |
-| `EMBED_BATCH_SIZE`                        | `25`                               | Embedding batch size during ingest.                                   |
-| `GENERATION_CONFIG_PATH`                  | _(data dir)_                       | Non-secret generation settings.                                       |
-| `MASTER_PROMPTS_PATH`                     | _(data dir)_                       | Saved master (system) prompts.                                        |
-| `LLAMA_CPP_SERVER`                        | _(auto)_                           | Absolute path to an existing `llama-server` executable.               |
-| `LLAMA_CPP_BASE_URL`                      | _(empty)_                          | Existing loopback-only llama.cpp server URL.                          |
-| `LLAMA_CPP_CONTEXT_SIZE`                  | `8192`                             | Managed local server context size.                                    |
-| `LLAMA_CPP_ACCELERATION`                  | `auto`                             | `auto`, `cpu`, `gpu`, `hybrid`, or `multi-gpu`.                       |
-| `LLAMA_CPP_GPU_LAYERS`                    | `20`                               | Exact layer offload for the hybrid profile.                           |
-| `LLAMA_CPP_SPLIT_MODE`                    | `layer`                            | Multi-GPU split: `layer` or `row`.                                    |
-| `LLAMA_CPP_MAIN_GPU`                      | `0`                                | Main GPU index for applicable profiles.                               |
-| `LLAMA_CPP_TENSOR_SPLIT`                  | _(empty)_                          | Optional multi-GPU proportions, e.g. `3,1`.                           |
-| `LLAMA_CPP_THREADS`                       | `-1`                               | CPU generation threads; `-1` lets llama.cpp choose.                   |
-| `LLAMA_CPP_FLASH_ATTENTION`               | `auto`                             | Flash Attention: `auto`, `on`, or `off`.                              |
-| `LLAMA_CPP_IDLE_UNLOAD_MINUTES`           | `0`                                | Unload the local model after this many idle minutes; `0` = never.     |
-| `THREADSHELF_API_KEY`                     | _(empty)_                          | Key required by the local model API (`/v1`); overrides Settings.      |
-| `LLAMA_MODEL_PATHS`                       | _(defaults)_                       | Extra model roots (`;` on Windows, `:` on macOS/Linux).               |
-| `THREADSHELF_TOOLS_PATH`                  | _(data dir)_                       | llama.cpp discovery/installer root.                                   |
-| `THREADSHELF_MODELS_PATH`                 | _(data dir)_                       | Catalog download root; always searched for models.                    |
-| `THREADSHELF_MODEL_CACHE`                 | _(data dir)_                       | Cache for the downloaded embedding model.                             |
-| `THREADSHELF_DISABLE_DEFAULT_MODEL_PATHS` | `0`                                | Set `1` to scan only explicitly configured roots.                     |
-| `HF_TOKEN`                                | _(empty)_                          | Hugging Face token; required only for gated repositories.             |
-| `HUGGING_FACE_HUB_TOKEN`                  | _(empty)_                          | Alternative name for `HF_TOKEN`.                                      |
-| `GITHUB_TOKEN`                            | _(empty)_                          | Raises the GitHub API rate limit for llama.cpp releases.              |
-| `GH_TOKEN`                                | _(empty)_                          | Alternative name for `GITHUB_TOKEN`.                                  |
-| `OPENROUTER_API_KEY`                      | _(empty)_                          | OpenRouter key; may be set in `.env`, never exposed to the browser.   |
-| `OPENROUTER_BASE_URL`                     | `https://openrouter.ai/api/v1`     | Override primarily intended for testing.                              |
+| Variable                                  | Default                        | Purpose                                                               |
+| ----------------------------------------- | ------------------------------ | --------------------------------------------------------------------- |
+| `PORT`                                    | `3000`                         | Server port.                                                          |
+| `HOST`                                    | `127.0.0.1`                    | Server host. Set explicitly only when trusted LAN access is required. |
+| `ALLOWED_HOSTS`                           | _(empty)_                      | Comma-separated extra Host/Origin names for trusted LAN access.       |
+| `THREADSHELF_DATA_DIR`                    | _(see Quick Start)_            | Root for all persistent data. Overrides the per-user default.         |
+| `LANCEDB_PATH`                            | _(data dir)_                   | LanceDB directory.                                                    |
+| `UPLOADS_DIR`                             | _(data dir)_                   | Uploaded source files.                                                |
+| `COLLECTIONS_PATH`                        | _(data dir)_                   | Manual-collections registry file.                                     |
+| `CHUNK_MAX_CHARS`                         | `2000`                         | Max characters per embedded chunk.                                    |
+| `CHUNK_OVERLAP_CHARS`                     | `100`                          | Overlap between long chunks.                                          |
+| `EMBED_BATCH_SIZE`                        | `25`                           | Embedding batch size during ingest.                                   |
+| `EMBED_BATCH_TOKEN_BUDGET`                | `2048`                         | Padded input token slots per batch (at least one full model context). |
+| `GENERATION_CONFIG_PATH`                  | _(data dir)_                   | Non-secret generation settings.                                       |
+| `MASTER_PROMPTS_PATH`                     | _(data dir)_                   | Saved master (system) prompts.                                        |
+| `LLAMA_CPP_SERVER`                        | _(auto)_                       | Absolute path to an existing `llama-server` executable.               |
+| `LLAMA_CPP_BASE_URL`                      | _(empty)_                      | Existing loopback-only llama.cpp server URL.                          |
+| `LLAMA_CPP_CONTEXT_SIZE`                  | `8192`                         | Managed local server context size.                                    |
+| `LLAMA_CPP_ACCELERATION`                  | `auto`                         | `auto`, `cpu`, `gpu`, `hybrid`, or `multi-gpu`.                       |
+| `LLAMA_CPP_GPU_LAYERS`                    | `20`                           | Exact layer offload for the hybrid profile.                           |
+| `LLAMA_CPP_SPLIT_MODE`                    | `layer`                        | Multi-GPU split: `layer` or `row`.                                    |
+| `LLAMA_CPP_MAIN_GPU`                      | `0`                            | Main GPU index for applicable profiles.                               |
+| `LLAMA_CPP_TENSOR_SPLIT`                  | _(empty)_                      | Optional multi-GPU proportions, e.g. `3,1`.                           |
+| `LLAMA_CPP_THREADS`                       | `-1`                           | CPU generation threads; `-1` lets llama.cpp choose.                   |
+| `LLAMA_CPP_FLASH_ATTENTION`               | `auto`                         | Flash Attention: `auto`, `on`, or `off`.                              |
+| `LLAMA_CPP_IDLE_UNLOAD_MINUTES`           | `0`                            | Unload the local model after this many idle minutes; `0` = never.     |
+| `THREADSHELF_API_KEY`                     | _(empty)_                      | Key required by the local model API (`/v1`); overrides Settings.      |
+| `LLAMA_MODEL_PATHS`                       | _(defaults)_                   | Extra model roots (`;` on Windows, `:` on macOS/Linux).               |
+| `THREADSHELF_TOOLS_PATH`                  | _(data dir)_                   | llama.cpp discovery/installer root.                                   |
+| `THREADSHELF_MODELS_PATH`                 | _(data dir)_                   | Catalog download root; always searched for models.                    |
+| `THREADSHELF_MODEL_CACHE`                 | _(data dir)_                   | Cache for the downloaded embedding model.                             |
+| `THREADSHELF_DISABLE_DEFAULT_MODEL_PATHS` | `0`                            | Set `1` to scan only explicitly configured roots.                     |
+| `HF_TOKEN`                                | _(empty)_                      | Hugging Face token; required only for gated repositories.             |
+| `HUGGING_FACE_HUB_TOKEN`                  | _(empty)_                      | Alternative name for `HF_TOKEN`.                                      |
+| `GITHUB_TOKEN`                            | _(empty)_                      | Raises the GitHub API rate limit for llama.cpp releases.              |
+| `GH_TOKEN`                                | _(empty)_                      | Alternative name for `GITHUB_TOKEN`.                                  |
+| `OPENROUTER_API_KEY`                      | _(empty)_                      | OpenRouter key; may be set in `.env`, never exposed to the browser.   |
+| `OPENROUTER_BASE_URL`                     | `https://openrouter.ai/api/v1` | Override primarily intended for testing.                              |
+| `THREADSHELF_EMBEDDING_PROVIDER`           | `local`                         | `local` MiniLM or explicit `cloudflare` BGE-M3 embeddings.             |
+| `CLOUDFLARE_ACCOUNT_ID`                    | _(empty)_                      | Account used by the optional Workers AI embedding provider.           |
+| `CLOUDFLARE_API_TOKEN`                     | _(empty)_                      | Workers AI token used for remote embeddings; keep it private.          |
 
 Paths given as _(data dir)_ default to a location inside the data directory
 described in [Quick Start](#quick-start); setting one explicitly still wins.

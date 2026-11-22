@@ -96,6 +96,7 @@ const LAYOUT = {
   models: { repo: ['.threadshelf', 'models'], user: ['models'] },
   tools: { repo: ['.threadshelf', 'tools'], user: ['tools'] },
   modelCache: { repo: ['.threadshelf', 'model-cache'], user: ['model-cache'] },
+  ingestJobs: { repo: ['.threadshelf', 'ingest-jobs.json'], user: ['ingest-jobs.json'] },
   env: { repo: ['.env'], user: ['.env'] },
 } as const;
 

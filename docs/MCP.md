@@ -15,15 +15,19 @@ MCP is useful when you want Cursor, Claude Desktop, or another MCP-aware client 
 - Start: `npm run mcp`
 - Data location: local LanceDB / ThreadShelf archive
 - Network service required for archive search: no
-- MCP tools: 9
+- MCP tools: 13
 
 The tools are:
 
 - `list_collections`
 - `list_files`
+- `import_queue_status`
 - `get_stats`
 - `search`
 - `read_thread`
+- `export_thread_markdown`
+- `list_thread_attachments`
+- `read_thread_image`
 - `obsidian_search`
 - `obsidian_read`
 - `obsidian_create`
@@ -72,7 +76,7 @@ The server communicates over stdio. It is not an HTTP server and should not be o
 ## Tested MCP clients
 
 The automated compatibility test starts the real ThreadShelf process over stdio,
-initializes an MCP session, confirms that `tools/list` returns all nine tools, and
+initializes an MCP session, confirms that `tools/list` returns all thirteen tools, and
 calls `list_collections` and `get_stats` against an isolated LanceDB directory.
 
 Claude Desktop and Cursor are documented configuration targets. Claude Desktop,
@@ -127,6 +131,14 @@ If a client does not support `cwd`, use an absolute repository path and run `tsx
 
 Current tools:
 
+`import_queue_status`
+
+- Reports the configured local import service, completed file count, and recent
+  progress lines. Configure `THREADSHELF_IMPORT_QUEUE_LEDGER` and
+  `THREADSHELF_IMPORT_QUEUE_UNIT`; set `THREADSHELF_IMPORT_QUEUE_TOTAL` only when
+  the queue's authoritative file total is known. Without it, total and remaining
+  counts are returned as `null`. The tool does not infer filenames or totals.
+
 `list_collections`
 
 - Lists local LanceDB collections.
@@ -180,6 +192,24 @@ Example arguments:
 - Pass the `conversationKey` returned by `search` when one export file contains
   multiple conversations.
 - Use after `search` returns a promising source file.
+
+`export_thread_markdown`
+
+- Accepts the same `sourceFile`, `collection`, and `conversationKey` arguments as `read_thread`.
+- Returns the same Markdown structure as the thread reader's **Export .md** action, directly as MCP text, with conversation headings, turn timestamps, and original text.
+- Exports the normalized archived text only; attachment files and image data are not included.
+
+`list_thread_attachments`
+
+- Accepts an indexed `sourceFile`, `collection` and required ChatGPT `conversationKey`.
+- Lists supported image and attachment references from the selected current branch of the original JSON file. It does not return file bytes. The original source must still be accessible and at most 64 MiB.
+- References in the source may point to missing export files; this tool does not verify availability in the original ZIP.
+
+`read_thread_image`
+
+- Takes `sourceFile`, `collection`, `conversationKey`, and an image `assetId` from `list_thread_attachments`.
+- If the operator configures `THREADSHELF_CHATGPT_EXPORT_ZIP` to the original export ZIP, returns an MCP image content block for an image referenced by that conversation. Supports PNG, JPEG, GIF, and WebP up to 8 MiB. Files are not extracted.
+- Requires the original JSON and ZIP. A reference may be absent from the ZIP; non-image attachments are not supported. The client controls image display and saving. Markdown export remains text-only.
 
 ## Resources
 

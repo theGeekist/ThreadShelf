@@ -1,7 +1,8 @@
 import { connect, type Connection, type Table } from '@lancedb/lancedb';
 import { dataPath } from './paths.js';
-import { embed, embedOne } from './embedding.js';
-import { chunkTurns, isIndexableText } from './chunking.js';
+import { embed, embedOne, getEmbeddingLimits } from './embedding.js';
+import { iterateTurnChunks, isIndexableText, splitTextByTokenBudget } from './chunking.js';
+import { streamEmbeddingsToStore } from './embedding-stream.js';
 import { validateTurns } from './validation.js';
 import type { Provider } from './parser.js';
 import { createHash } from 'node:crypto';
@@ -9,6 +10,7 @@ import { portableModelLabel } from './model-label.js';
 
 const DB_PATH = process.env.LANCEDB_PATH || dataPath('lancedb');
 const EMBED_BATCH_SIZE = Math.max(1, Number(process.env.EMBED_BATCH_SIZE) || 25);
+const EMBED_BATCH_TOKEN_BUDGET = Math.max(1, Number(process.env.EMBED_BATCH_TOKEN_BUDGET) || 2048);
 
 let db: Connection | null = null;
 const tableCache = new Map<string, Table>();
@@ -72,7 +74,7 @@ interface ChunkWriteOptions {
   readonly signal?: AbortSignal;
   readonly onEmbeddingProgress?: (
     done: number,
-    total: number,
+    total: number | undefined,
     tokens: number,
   ) => void | Promise<void>;
 }
@@ -108,67 +110,52 @@ const ensureChunkMetadataSchema = async (tbl: Table): Promise<ReadonlySet<string
   return existing;
 };
 
-// A merge is one LanceDB commit: an insertion failure cannot expose a delete.
-const replaceEmbeddedRowsLocked = async (
+// Each bounded upsert is one LanceDB commit. Pending archive markers hide the
+// source from search until every batch has been written and acknowledged.
+const upsertEmbeddedRows = async (
   collection: string,
-  where: string,
-  rows: EmbeddedChunkRow[],
+  rows: readonly EmbeddedChunkRow[],
 ): Promise<void> => {
+  if (!rows.length) return;
   const tbl = await openTable(collection);
   if (tbl) {
     await ensureChunkMetadataSchema(tbl);
-    if (!rows.length) await tbl.delete(where);
-    else
-      await tbl
-        .mergeInsert('id')
-        .whenMatchedUpdateAll()
-        .whenNotMatchedInsertAll()
-        .whenNotMatchedBySourceDelete({ where })
-        .execute(rows);
-  } else if (rows.length) {
-    const created = await (await getDb()).createTable(collection, rows, { mode: 'create' });
+    await tbl.checkoutLatest();
+    await tbl
+      .mergeInsert('id')
+      .whenMatchedUpdateAll()
+      .whenNotMatchedInsertAll()
+      .execute([...rows]);
+  } else {
+    const created = await (await getDb()).createTable(collection, [...rows], { mode: 'create' });
     tableCache.set(collection, created);
   }
   invalidateCollectionStats(collection);
 };
 
-const embedChunks = async (
-  chunks: ChunkRow[],
-  signal?: AbortSignal,
-  onProgress?: ChunkWriteOptions['onEmbeddingProgress'],
-): Promise<EmbeddedChunkRow[]> => {
-  const tokens = chunks.reduce((sum, chunk) => sum + Math.ceil(chunk.text.length / 4), 0);
-  await onProgress?.(0, chunks.length, tokens);
-  if (chunks.length === 0) return [];
-  const rows: EmbeddedChunkRow[] = [];
-
-  for (let i = 0; i < chunks.length; i += EMBED_BATCH_SIZE) {
-    signal?.throwIfAborted();
-    const batch = chunks.slice(i, i + EMBED_BATCH_SIZE);
-    const texts = batch.map((ch) => ch.text);
-    const embeddings = await embed(texts);
-    signal?.throwIfAborted();
-    rows.push(
-      ...batch.map((ch, j) => ({
-        id: ch.id,
-        vector: embeddings[j]!,
-        document: ch.text,
-        sourceFile: ch.sourceFile,
-        provider: ch.provider,
-        conversationKey: ch.conversationKey ?? '',
-        title: ch.title ?? '',
-        role: ch.role,
-        turnIndex: String(ch.turnIndex),
-        model: ch.model ?? '',
-        createdAt: ch.createdAt ?? '',
-        createdInThreadShelf: ch.createdInThreadShelf ?? false,
-        generationProvider: ch.generationProvider ?? '',
-      })),
-    );
-    await onProgress?.(rows.length, chunks.length, tokens);
-  }
-  return rows;
+const deleteEmbeddedRows = async (collection: string, where: string): Promise<void> => {
+  const tbl = await openTable(collection);
+  if (!tbl) return;
+  await tbl.checkoutLatest();
+  await tbl.delete(where);
+  invalidateCollectionStats(collection);
 };
+
+const rowFromEmbeddedChunk = (chunk: ChunkRow, vector: number[]): EmbeddedChunkRow => ({
+  id: chunk.id,
+  vector,
+  document: chunk.text,
+  sourceFile: chunk.sourceFile,
+  provider: chunk.provider,
+  conversationKey: chunk.conversationKey ?? '',
+  title: chunk.title ?? '',
+  role: chunk.role,
+  turnIndex: String(chunk.turnIndex),
+  model: chunk.model ?? '',
+  createdAt: chunk.createdAt ?? '',
+  createdInThreadShelf: chunk.createdInThreadShelf ?? false,
+  generationProvider: chunk.generationProvider ?? '',
+});
 
 // --- Stored threads ---
 //
@@ -611,30 +598,80 @@ const conversationFromRow = (row: Record<string, unknown>): ThreadConversationIn
   }
 };
 
-const chunksFromThreadRows = (
-  rows: Record<string, unknown>[],
-): { chunks: ChunkRow[]; invalid: Record<string, unknown>[] } => {
-  const invalid: Record<string, unknown>[] = [];
-  const chunks = rows.flatMap((row) => {
-    if (row.indexPending === 'delete' || row.indexPending === 'reset') return [];
+const invalidThreadRows = (rows: Record<string, unknown>[]): Record<string, unknown>[] =>
+  rows.filter(
+    (row) =>
+      row.indexPending !== 'delete' && row.indexPending !== 'reset' && !conversationFromRow(row),
+  );
+
+const iterateThreadChunks = function* (
+  rows: readonly Record<string, unknown>[],
+  maxInputTokens: number,
+  countTokens: (text: string) => number,
+): Generator<ChunkRow> {
+  for (const row of rows) {
+    if (row.indexPending === 'delete' || row.indexPending === 'reset') continue;
     const conversation = conversationFromRow(row);
-    if (!conversation) {
-      invalid.push(row);
-      return [];
-    }
-    const turns = validateTurns(conversation.turns);
-    return chunkTurns(turns, {
+    if (!conversation) continue;
+    let chunkIndex = 0;
+    const chunks = iterateTurnChunks(validateTurns(conversation.turns), {
       sourceFile: String(row.sourceFile),
       provider: row.provider as Provider | 'threadshelf',
       conversationKey: String(row.conversationKey),
       title: String(row.title),
-    }).map((chunk, index) => ({
-      ...chunk,
-      provider: chunk.createdInThreadShelf ? 'threadshelf' : chunk.provider,
-      id: `${row.sourceFile}|${row.conversationKey}|${chunk.turnIndex}|${index}`,
-    }));
+    });
+    for (const chunk of chunks) {
+      for (const text of splitTextByTokenBudget(chunk.text, maxInputTokens, countTokens)) {
+        yield {
+          ...chunk,
+          text,
+          provider: chunk.createdInThreadShelf ? 'threadshelf' : chunk.provider,
+          id: `${row.sourceFile}|${row.conversationKey}|${chunk.turnIndex}|${chunkIndex++}`,
+        };
+      }
+    }
+  }
+};
+
+const streamThreadRowsToIndex = async (
+  collection: string,
+  rows: readonly Record<string, unknown>[],
+  options: ChunkWriteOptions,
+  chunkFilter: (chunk: ChunkRow) => boolean = () => true,
+): Promise<number> => {
+  const limits = await getEmbeddingLimits();
+  let totalChunks = 0;
+  for (const chunk of iterateThreadChunks(rows, limits.maxInputTokens, limits.countTokens)) {
+    if (!chunkFilter(chunk)) continue;
+    totalChunks++;
+  }
+  let totalTokens = 0;
+  let chunksWritten: number;
+  await options.onEmbeddingProgress?.(0, totalChunks, 0);
+  const source = (function* () {
+    for (const chunk of iterateThreadChunks(rows, limits.maxInputTokens, limits.countTokens)) {
+      if (chunkFilter(chunk)) yield chunk;
+    }
+  })();
+  chunksWritten = await streamEmbeddingsToStore({
+    source,
+    signal: options.signal,
+    maxBatchSize: EMBED_BATCH_SIZE,
+    paddedTokenBudget: EMBED_BATCH_TOKEN_BUDGET,
+    maxInputTokens: limits.maxInputTokens,
+    countTokens: limits.countTokens,
+    embedBatch: async (batch) => {
+      const vectors = await embed(batch.map((chunk) => chunk.text));
+      return batch.map((chunk, index) => rowFromEmbeddedChunk(chunk, vectors[index]!));
+    },
+    writeBatch: (batch) => upsertEmbeddedRows(collection, batch),
+    onBatchCommitted: async (done, batch) => {
+      chunksWritten = done;
+      totalTokens += batch.reduce((sum, chunk) => sum + Math.ceil(chunk.text.length / 4), 0);
+      await options.onEmbeddingProgress?.(done, totalChunks, totalTokens);
+    },
   });
-  return { chunks, invalid };
+  return chunksWritten;
 };
 
 const readThreadScope = async (where: string): Promise<Record<string, unknown>[]> => {
@@ -741,31 +778,50 @@ export const replaceImportedFiles = async (
           continue;
         next.push({ ...old, indexPending: 'all' });
       }
-      const { chunks, invalid } = chunksFromThreadRows(next);
-      const embedded = await embedChunks(chunks, options.signal, options.onEmbeddingProgress);
-      options.signal?.throwIfAborted();
+      const invalid = invalidThreadRows(next);
+      const resetMarker = options.clearFirst
+        ? threadRows(
+            collection,
+            'threadshelf://collection-reset',
+            'threadshelf',
+            [{ key: '__reset', title: '', turns: [] }],
+            'reset',
+          )
+        : [];
+      let publishedSnapshot: Record<string, unknown>[] = [];
       const committed = await withCollectionWriteLock(THREADS_TABLE, async () => {
         if (snapshotFingerprint(previous) !== snapshotFingerprint(await readThreadScope(scope)))
           return false;
         options.signal?.throwIfAborted();
-        const resetMarker = options.clearFirst
-          ? threadRows(
-              collection,
-              'threadshelf://collection-reset',
-              'threadshelf',
-              [{ key: '__reset', title: '', turns: [] }],
-              'reset',
-            )
-          : [];
         await replaceThreadRowsLocked(scope, [...next, ...resetMarker]);
-        const chunkScope = options.clearFirst
-          ? 'true'
-          : files.map((file) => `sourceFile = '${escapeSqlString(file.sourceFile)}'`).join(' OR ');
-        await replaceEmbeddedRowsLocked(collection, chunkScope, embedded);
+        publishedSnapshot = await readThreadScope(scope);
+        return true;
+      });
+      if (!committed) continue;
+
+      // Publish the pending marker before touching vectors. Search excludes the
+      // affected file (or the full collection for clearFirst) while batches land.
+      const chunkScope = options.clearFirst
+        ? 'true'
+        : files.map((file) => `sourceFile = '${escapeSqlString(file.sourceFile)}'`).join(' OR ');
+      await deleteEmbeddedRows(collection, chunkScope);
+      // Once archive publication succeeds, finish the index commit even if the
+      // importing client disconnects. The durable marker still protects search.
+      const chunkCount = await streamThreadRowsToIndex(collection, next, {
+        ...options,
+        signal: undefined,
+      });
+
+      const acknowledged = await withCollectionWriteLock(THREADS_TABLE, async () => {
+        if (
+          snapshotFingerprint(publishedSnapshot) !==
+          snapshotFingerprint(await readThreadScope(scope))
+        )
+          return false;
         await acknowledgeIndexLocked(scope, invalid);
         return true;
       });
-      if (committed) return chunks.length;
+      if (acknowledged) return chunkCount;
     }
     throw new StoredThreadWriteError(
       'Archive changed repeatedly while embedding; retry the import',
@@ -824,9 +880,17 @@ export const indexStoredFile = async (
       const full =
         reset || rows.some((row) => row.indexPending === 'all' || row.indexPending === 'delete');
       try {
-        const prepared = chunksFromThreadRows(rows);
-        const chunks = prepared.chunks.filter((chunk) => full || chunk.createdInThreadShelf);
-        const embedded = await embedChunks(chunks, options.signal, options.onEmbeddingProgress);
+        const invalid = invalidThreadRows(rows);
+        const vectorScope = reset
+          ? 'true'
+          : `sourceFile = '${escapeSqlString(sourceFile)}'${full ? '' : ' AND createdInThreadShelf = true'}`;
+        await deleteEmbeddedRows(collection, vectorScope);
+        const chunkCount = await streamThreadRowsToIndex(
+          collection,
+          rows,
+          options,
+          (chunk) => full || Boolean(chunk.createdInThreadShelf),
+        );
         const committed = await withCollectionWriteLock(THREADS_TABLE, async () => {
           const current = await indexScope(collection, sourceFile);
           if (
@@ -834,17 +898,10 @@ export const indexStoredFile = async (
             snapshotFingerprint(rows) !== snapshotFingerprint(current.rows)
           )
             return false;
-          await replaceEmbeddedRowsLocked(
-            collection,
-            reset
-              ? 'true'
-              : `sourceFile = '${escapeSqlString(sourceFile)}'${full ? '' : ' AND createdInThreadShelf = true'}`,
-            embedded,
-          );
-          await acknowledgeIndexLocked(where, prepared.invalid);
+          await acknowledgeIndexLocked(where, invalid);
           return true;
         });
-        if (committed) return chunks.length;
+        if (committed) return chunkCount;
       } catch (error) {
         await withCollectionWriteLock(THREADS_TABLE, async () => {
           if (snapshotFingerprint(rows) !== snapshotFingerprint(await readThreadScope(where)))
@@ -876,11 +933,7 @@ export const deleteStoredFile = async (collection: string, sourceFile: string): 
     withCollectionWriteLock(THREADS_TABLE, async () => {
       const where = threadFileFilter(collection, sourceFile);
       await replaceThreadRowsLocked(where, []);
-      await replaceEmbeddedRowsLocked(
-        collection,
-        `sourceFile = '${escapeSqlString(sourceFile)}'`,
-        [],
-      );
+      await deleteEmbeddedRows(collection, `sourceFile = '${escapeSqlString(sourceFile)}'`);
       await acknowledgeIndexLocked(where);
     }),
   );

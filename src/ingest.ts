@@ -253,6 +253,7 @@ const ingestFilesInternal = async (
           signal: opts.signal,
           onEmbeddingProgress: (done, total, tokens) => {
             totalTokens = previousTokens + tokens;
+            const chunkProgress = total === undefined ? undefined : done / Math.max(total, 1);
             onProgress({
               status: 'progress',
               phase: 'embedding',
@@ -265,7 +266,9 @@ const ingestFilesInternal = async (
               embeddingDone: done,
               embeddingTotal: total,
               progressPercent:
-                (95 * (processedFiles + done / Math.max(total, 1))) / Math.max(totalFiles, 1),
+                chunkProgress === undefined
+                  ? undefined
+                  : (95 * (processedFiles + chunkProgress)) / Math.max(totalFiles, 1),
             });
           },
         });
@@ -301,6 +304,7 @@ const ingestFilesInternal = async (
         signal: opts.signal,
         onEmbeddingProgress: (done, total, tokens) => {
           totalTokens = tokens;
+          const chunkProgress = total === undefined ? undefined : done / Math.max(total, 1);
           onProgress({
             status: 'progress',
             phase: 'embedding',
@@ -311,7 +315,7 @@ const ingestFilesInternal = async (
             elapsedMs: Date.now() - startTime,
             embeddingDone: done,
             embeddingTotal: total,
-            progressPercent: 20 + (75 * done) / Math.max(total, 1),
+            progressPercent: chunkProgress === undefined ? undefined : 20 + 75 * chunkProgress,
           });
         },
       });

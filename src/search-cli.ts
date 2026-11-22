@@ -1,4 +1,5 @@
 #!/usr/bin/env tsx
+import './env.js';
 import { invocation } from './paths.js';
 import { searchAcrossCollections } from './services/search.js';
 import { recoverPendingIndexes } from './store.js';

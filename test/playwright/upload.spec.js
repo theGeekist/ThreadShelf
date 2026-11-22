@@ -8,28 +8,69 @@ const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const fixturesDir = join(__dirname, '..', 'fixtures');
 
 test.describe('Upload + ingest UI flow', () => {
-  test('can stop an in-progress path index request', async ({ appPage }) => {
-    let releaseResponse;
-    const responseGate = new Promise((resolve) => {
-      releaseResponse = resolve;
-    });
-    await appPage.route('**/api/ingest-progress', async (route) => {
-      await responseGate;
-      await route
-        .fulfill({
-          contentType: 'application/x-ndjson',
-          body: `${JSON.stringify({ status: 'starting', totalFiles: 10, processedFiles: 0 })}\n`,
-        })
-        .catch(() => {});
+  test('selects files and pauses and continues a saved path indexing job', async ({ appPage }) => {
+    const files = ['/tmp/fixture/first.json', '/tmp/fixture/second.json'];
+    let job = null;
+    let acceptedFiles = [];
+    await appPage.route('**/api/ingest-preview**', (route) =>
+      route.fulfill({
+        contentType: 'application/json',
+        json: { collection: 'pw_fixture', files, duplicates: [] },
+      }),
+    );
+    await appPage.route('**/api/ingest-jobs**', async (route) => {
+      const request = route.request();
+      const pathname = new URL(request.url()).pathname;
+      if (request.method() === 'GET') {
+        return route.fulfill({ contentType: 'application/json', json: { job } });
+      }
+      if (pathname.endsWith('/stop')) {
+        job = {
+          ...job,
+          state: 'stopped',
+          files: job.files.map((file) =>
+            file.state === 'running' ? { path: file.path, state: 'pending' } : file,
+          ),
+        };
+        return route.fulfill({ contentType: 'application/json', json: { job } });
+      }
+      if (pathname.endsWith('/continue')) {
+        job = { ...job, state: 'running' };
+        return route.fulfill({ contentType: 'application/json', json: { job } });
+      }
+      const payload = request.postDataJSON();
+      acceptedFiles = payload.selectedFiles;
+      job = {
+        id: 'saved-job-test',
+        collection: payload.collection,
+        folderPath: '/tmp/fixture',
+        state: 'running',
+        files: acceptedFiles.map((path) => ({ path, state: 'running' })),
+        progress: { status: 'progress', phase: 'reading', progressPercent: 10 },
+      };
+      return route.fulfill({ status: 202, contentType: 'application/json', json: { job } });
     });
 
     await appPage.locator('#indexingNavBtn').click();
-    await appPage.getByPlaceholder('/absolute/path/to/exports').fill('C:\\fixture\\exports');
+    await appPage.getByPlaceholder('/absolute/path/to/exports').fill('/tmp/fixture');
+    await appPage.getByRole('button', { name: 'Use path' }).click();
+    await expect(appPage.getByLabel('Select first.json')).toBeChecked();
+    await appPage.getByLabel('Select first.json').uncheck();
     await appPage.locator('#ingestBtn').click();
-    await expect(appPage.locator('#stopIngestBtn')).toBeVisible();
-    await appPage.locator('#stopIngestBtn').click();
-    await expect(appPage.locator('#ingestStatus')).toContainText('Indexing stopped');
-    releaseResponse();
+    await expect(appPage.locator('.saved-job-panel')).toContainText('running');
+    await expect(appPage.getByRole('button', { name: 'Pause indexing' })).toBeVisible();
+    expect(acceptedFiles).toEqual(['/tmp/fixture/second.json']);
+
+    await appPage.getByRole('button', { name: 'Pause indexing' }).click();
+    await expect(appPage.locator('.saved-job-panel')).toContainText('stopped');
+    await appPage.getByRole('button', { name: 'Continue' }).click();
+    await expect(appPage.getByRole('button', { name: 'Pause indexing' })).toBeVisible();
+    await appPage.getByRole('button', { name: 'Pause indexing' }).click();
+    await expect(appPage.locator('.saved-job-panel')).toContainText('stopped');
+    await appPage.screenshot({
+      path: join(tmpdir(), 'threadshelf-indexing-screen.png'),
+      fullPage: true,
+    });
   });
 
   test('uploading a folder of exports adds a new collection', async ({ appPage }) => {

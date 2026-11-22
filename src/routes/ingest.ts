@@ -8,6 +8,12 @@ import { dataPath } from '../paths.js';
 import { ingestFolder, listExportFiles } from '../ingest.js';
 import { listSourceFilesInCollection } from '../store.js';
 import {
+  continueIngestJob,
+  createIngestJob,
+  getIngestJob,
+  stopIngestJob,
+} from '../services/ingest-jobs.js';
+import {
   ValidationError,
   normalizeCollectionName,
   normalizeCollectionSelector,
@@ -342,6 +348,67 @@ router.post('/api/ingest-progress', async (req, res) => {
     }
   } finally {
     res.end();
+  }
+});
+
+const sendIngestJobError = (res: import('express').Response, error: unknown): void => {
+  const status = (error as { status?: unknown })?.status;
+  res
+    .status(typeof status === 'number' ? status : error instanceof ValidationError ? 400 : 500)
+    .json({
+      error: error instanceof Error ? error.message : String(error),
+    });
+};
+
+router.get('/api/ingest-jobs', async (req, res) => {
+  try {
+    const collection = normalizeCollectionSelector(req.query.collection);
+    res.json({ job: await getIngestJob(collection) });
+  } catch (error) {
+    sendIngestJobError(res, error);
+  }
+});
+
+router.post('/api/ingest-jobs', async (req, res) => {
+  const { folderPath, selectedFiles } = req.body ?? {};
+  if (
+    typeof folderPath !== 'string' ||
+    folderPath.trim().length === 0 ||
+    folderPath.length > 4096 ||
+    folderPath.includes('\0')
+  ) {
+    return res.status(400).json({ error: 'Invalid folderPath' });
+  }
+  let collection: string;
+  try {
+    collection = normalizeCollectionName(req.body?.collection);
+    if (collection === 'threadshelf_conversations') {
+      return res.status(400).json({ error: `Collection cannot be indexed: ${collection}` });
+    }
+  } catch (error) {
+    return sendIngestJobError(res, error);
+  }
+  try {
+    const job = await createIngestJob(folderPath, collection, selectedFiles);
+    res.status(202).json({ job });
+  } catch (error) {
+    sendIngestJobError(res, error);
+  }
+});
+
+router.post('/api/ingest-jobs/:id/stop', async (req, res) => {
+  try {
+    res.json({ job: await stopIngestJob(req.params.id) });
+  } catch (error) {
+    sendIngestJobError(res, error);
+  }
+});
+
+router.post('/api/ingest-jobs/:id/continue', async (req, res) => {
+  try {
+    res.json({ job: await continueIngestJob(req.params.id) });
+  } catch (error) {
+    sendIngestJobError(res, error);
   }
 });
 

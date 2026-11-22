@@ -1,20 +1,37 @@
 import { dataPath } from './paths.js';
+import {
+  CLOUDFLARE_EMBEDDING_DIMENSION,
+  CLOUDFLARE_MAX_INPUT_TOKENS,
+  countCloudflareInputTokens,
+  embedWithCloudflare,
+} from './cloudflare-embedding.js';
 
 interface PipelineOutput {
   readonly data: Float32Array;
   readonly dims?: number[];
 }
 
-type Pipeline = (
+interface EmbeddingTokenizer {
+  readonly model_max_length?: number;
+  encode: (text: string) => number[];
+}
+
+type Pipeline = ((
   text: string | string[],
   options: Record<string, unknown>,
-) => Promise<PipelineOutput>;
+) => Promise<PipelineOutput>) & {
+  readonly tokenizer?: EmbeddingTokenizer;
+  readonly model?: { readonly config?: { readonly max_position_embeddings?: number } };
+};
 
 const MODEL = 'Xenova/paraphrase-multilingual-MiniLM-L12-v2';
 const DIMENSION = 384;
+let loadedPipeline: Promise<Pipeline> | undefined;
 
 export const getDimension = (): number => {
-  return DIMENSION;
+  return process.env.THREADSHELF_EMBEDDING_PROVIDER === 'cloudflare'
+    ? CLOUDFLARE_EMBEDDING_DIMENSION
+    : DIMENSION;
 };
 
 const loadPipeline = async (): Promise<Pipeline> => {
@@ -31,6 +48,14 @@ const loadPipeline = async (): Promise<Pipeline> => {
       if (info.status === 'progress') console.error('[embedding]', info.file, info.progress);
     },
   })) as Pipeline;
+};
+
+const getPipeline = (): Promise<Pipeline> => {
+  loadedPipeline ??= loadPipeline().catch((error) => {
+    loadedPipeline = undefined;
+    throw error;
+  });
+  return loadedPipeline;
 };
 
 export const createEmbedder = (load: () => Promise<Pipeline>) => {
@@ -65,7 +90,39 @@ export const createEmbedder = (load: () => Promise<Pipeline>) => {
   };
 };
 
-export const embed = createEmbedder(loadPipeline);
+const embedLocal = createEmbedder(getPipeline);
+export const embed = (texts: string[]): Promise<number[][]> =>
+  process.env.THREADSHELF_EMBEDDING_PROVIDER === 'cloudflare'
+    ? embedWithCloudflare(texts)
+    : embedLocal(texts);
+
+export interface EmbeddingLimits {
+  readonly maxInputTokens: number;
+  readonly countTokens: (text: string) => number;
+}
+
+/** Use the active model's tokenizer and context limit; do not guess from characters. */
+export const getEmbeddingLimits = async (): Promise<EmbeddingLimits> => {
+  if (process.env.THREADSHELF_EMBEDDING_PROVIDER === 'cloudflare') {
+    return {
+      maxInputTokens: CLOUDFLARE_MAX_INPUT_TOKENS,
+      countTokens: countCloudflareInputTokens,
+    };
+  }
+  const pipe = await getPipeline();
+  const tokenizer = pipe.tokenizer;
+  if (!tokenizer) throw new Error('Embedding pipeline did not expose its tokenizer');
+
+  const limits = [tokenizer.model_max_length, pipe.model?.config?.max_position_embeddings].filter(
+    (value): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0,
+  );
+  if (limits.length === 0) throw new Error('Embedding model did not expose its input token limit');
+
+  return {
+    maxInputTokens: Math.floor(Math.min(...limits)),
+    countTokens: (text) => tokenizer.encode(text).length,
+  };
+};
 
 export const embedOne = async (text: string): Promise<number[]> => {
   const [v] = await embed([text]);

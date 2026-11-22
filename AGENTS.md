@@ -15,6 +15,10 @@ React web UI, an HTTP API, and an MCP stdio server.
 
 Parsing, embeddings, storage, and search run on the user's machine. **By default,
 no chat data leaves the device.** The embedding model may be downloaded on first use.
+Setting `THREADSHELF_EMBEDDING_PROVIDER=cloudflare` explicitly sends chunk text
+and search queries to Cloudflare Workers AI (`@cf/baai/bge-m3`); this provider
+requires a separately reindexed 1,024-dimensional LanceDB database. Keep local
+MiniLM as the default and never mix vectors from the two embedding spaces.
 Treat all real chat exports as private.
 
 The optional conversation-generation layer's primary `llama.cpp` engine is
@@ -59,6 +63,7 @@ src/                Server + core logic (TypeScript, ESM, run via tsx)
     local-origin.ts        Host/Origin guards: `/api` + loopback `/v1`, and the network listener
     stream-abort.ts        Shared "client went away" AbortController for streamed routes
   services/         search, thread, collections, insights business logic
+    ingest-jobs.ts      Persistent saved folder-indexing jobs with stop/resume
   obsidian/         Local vault config, safe Markdown operations, scoped tools and browser deletion approvals
   generation/       Generation provider plugins, config, model discovery, llama wrapper
     downloader.ts          Shared resumable, hash-verifying downloader (runtime + models)
@@ -113,6 +118,8 @@ root installs both.
 | `npm run parse -- <file> -- [flags]`                 | Parse one export to normalized JSON; the second `--` is required before flags.          |
 | `npm run ingest -- <folder> [collection] -- [flags]` | Ingest a folder (`--clear`; `--watch`; `--debounce`).                                   |
 | `npm run search -- "<query>" -- [flags]`             | Search from the CLI (`--mode keyword`, `--collection`, `--n`, `--json`).                |
+| `npm run reindex:cloudflare -- [flags]`               | Stream current LanceDB chunk text into a separate BGE-M3 index.                         |
+| `npm run bench:ingest-stream`                         | Compare synthetic whole-array and bounded streaming ingest memory and time.            |
 | `npm run bench:search -- --check`                     | Run the isolated synthetic search-quality benchmark against its baseline.             |
 | `npm run setup:llama`                                | Local discovery only; `-- -- --check` reads metadata; install needs explicit consent.   |
 | `npm run build:package`                              | Build the publishable package: client UI into `public/`, server + MCP into `dist/`.     |
@@ -190,7 +197,17 @@ stored thread -> generation registry -> llama.cpp (local) OR Strata (local, exte
   `createdInThreadShelf: true`. It has no fake export file. Completed exchanges
   and imported-thread continuations are persisted by `src/generation/threads.ts`
   and only their ThreadShelf-authored chunks are refreshed in semantic search.
-- Archive replacements use a single LanceDB merge commit. `__threads.indexPending`
+- Archive replacements first commit turns with `__threads.indexPending`, then
+  stream tokenizer-bounded chunks through bounded embedding batches into LanceDB.
+  `EMBED_BATCH_SIZE` caps chunk count (default 25); `EMBED_BATCH_TOKEN_BUDGET`
+  caps padded model input slots (default 2048). The active model tokenizer and
+  context limit determine chunk splitting, so changing embedding models changes
+  the bound without hardcoding a model's window. Inference and LanceDB writes run
+  in the same Node stream pipeline; bounded object-mode queues allow overlap and
+  apply ordinary backpressure only when the sink falls behind. A failed or
+  interrupted rebuild can leave partial vectors physically stored, but the
+  pending marker keeps that scope out of search until recovery completes.
+  `__threads.indexPending`
   is a durable index job, committed with the turns (`local`, `all`, `delete`, or
   collection-wide `reset`; empty means indexed; `invalid` marks an undecodable
   row whose raw data is retained). The HTTP server, MCP server and `ingest`/`search`
@@ -199,8 +216,9 @@ stored thread -> generation registry -> llama.cpp (local) OR Strata (local, exte
   after 8 attempts until the thread changes. Deletion tombstones and reset
   markers are hidden from thread lists; pending full replacements are hidden from
   search until their matching vectors are published. Embedding never runs under
-  the global `__threads` lock: read a snapshot, embed, then re-check the snapshot
-  before committing (retry on change). Keep collection then thread-table lock
+  the global `__threads` lock: publish the pending snapshot, stream and commit
+  vector batches, then re-check the archive before acknowledging (retry on
+  change). Keep collection then thread-table lock
   ordering; never queue saved turn snapshots for a later retry. LanceDB is opened
   with `readConsistencyInterval: 0` so processes see each other's commits.
 - Rename updates only the title column; appends build turns from the current row
@@ -320,15 +338,18 @@ operations. All server test helpers must set `OBSIDIAN_CONFIG_PATH` to isolated
 temp storage; tests must never connect to the developer's real vault. See
 `docs/OBSIDIAN.md` for bounds and limitations.
 
-Three, all opt-in and none of them carrying chat content:
+The following external network surfaces are opt-in:
 
-1. **OpenRouter** — the only surface that sends conversation text off-device.
-2. **GitHub Releases** (`ggml-org/llama.cpp`) — release metadata; archives only
+1. **OpenRouter** — sends selected conversation text to the chosen model.
+2. **Cloudflare Workers AI** — when the Cloudflare embedding provider is selected,
+   sends chunk text and search queries to `@cf/baai/bge-m3`. Requires an account ID
+   and API token; the default remains local MiniLM.
+3. **GitHub Releases** (`ggml-org/llama.cpp`) — release metadata; archives only
    after explicit `--install`/`--url` consent or the setup screen's confirmation.
    Upstream's `/releases/latest` points at a semver release with no binaries, so
    `resolveLlamaRelease` follows the `nightly-tag.txt` pointer to the real
    `bNNNNN` build. `GITHUB_TOKEN` raises the anonymous rate limit.
-3. **Hugging Face Hub** — catalog metadata and GGUF downloads. The public API
+4. **Hugging Face Hub** — catalog metadata and GGUF downloads. The public API
    needs no token; `HF_TOKEN` is only required for *gated* repositories, which
    are detected up front and marked in the UI. Every file is verified against the
    LFS `oid` (its SHA-256) before it is moved into place.
@@ -381,6 +402,9 @@ starts it with no clone and no build.
 
 When you finish a task, update this file if you changed commands, layout, or
 conventions.
+
+Cloudflare embeddings setup and the separate-index migration command are
+documented in `docs/CLOUDFLARE_EMBEDDINGS.md`.
 
 ## Vision runtime
 

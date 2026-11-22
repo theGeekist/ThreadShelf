@@ -8,6 +8,7 @@ import type {
   CollectionStats,
   ConversationListItem,
   IngestStreamEvent,
+  IngestJob,
   SearchResult,
   ThreadTurn,
   GenerationConfigResponse,
@@ -557,6 +558,33 @@ export const api = {
       files: string[];
       duplicates: Array<{ sourceFile: string; name: string; canonicalPath: string }>;
     }>(buildUrl('/api/ingest-preview', { folderPath, collection }), { signal });
+  },
+
+  ingestJob(collection: string, signal?: AbortSignal) {
+    return request<{ job: IngestJob | null }>(
+      buildUrl('/api/ingest-jobs', { collection }),
+      { signal },
+    );
+  },
+
+  startIngestJob(folderPath: string, collection: string, selectedFiles: string[]) {
+    return request<{ job: IngestJob }>('/api/ingest-jobs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ folderPath, collection, selectedFiles }),
+    });
+  },
+
+  stopIngestJob(id: string) {
+    return request<{ job: IngestJob }>(`/api/ingest-jobs/${encodeURIComponent(id)}/stop`, {
+      method: 'POST',
+    });
+  },
+
+  continueIngestJob(id: string) {
+    return request<{ job: IngestJob }>(`/api/ingest-jobs/${encodeURIComponent(id)}/continue`, {
+      method: 'POST',
+    });
   },
 
   async ingestUpload(files: File[], collectionName: string, clearFirst: boolean) {
