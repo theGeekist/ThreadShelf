@@ -1,9 +1,9 @@
 import { dataPath } from './paths.js';
 import {
-  CLOUDFLARE_EMBEDDING_DIMENSION,
-  CLOUDFLARE_MAX_INPUT_TOKENS,
   countCloudflareInputTokens,
   embedWithCloudflare,
+  getCloudflareEmbeddingDimension,
+  getCloudflareMaxInputTokens,
 } from './cloudflare-embedding.js';
 
 interface PipelineOutput {
@@ -29,10 +29,25 @@ const DIMENSION = 384;
 let loadedPipeline: Promise<Pipeline> | undefined;
 
 export const getDimension = (): number => {
-  return process.env.THREADSHELF_EMBEDDING_PROVIDER === 'cloudflare'
-    ? CLOUDFLARE_EMBEDDING_DIMENSION
-    : DIMENSION;
+  return getEmbeddingProvider() === 'cloudflare' ? getCloudflareEmbeddingDimension() : DIMENSION;
 };
+
+export type EmbeddingProvider = 'cloudflare' | 'local';
+export const getEmbeddingProvider = (): EmbeddingProvider =>
+  process.env.THREADSHELF_EMBEDDING_PROVIDER === 'local' ? 'local' : 'cloudflare';
+
+/** Stable model identity for durable index jobs; excludes credentials. */
+export const getEmbeddingModelIdentity = (): string =>
+  getEmbeddingProvider() === 'cloudflare'
+    ? JSON.stringify({
+        provider: 'cloudflare-openai-compatible',
+        endpoint:
+          process.env.THREADSHELF_EMBEDDING_BASE_URL?.trim().replace(/\/+$/, '') || 'cloudflare',
+        model: process.env.THREADSHELF_EMBEDDING_MODEL?.trim() || '@cf/baai/bge-m3',
+        dimension: getCloudflareEmbeddingDimension(),
+        maxInputTokens: getCloudflareMaxInputTokens(),
+      })
+    : JSON.stringify({ provider: 'local', model: MODEL, dimension: DIMENSION });
 
 const loadPipeline = async (): Promise<Pipeline> => {
   const { env, pipeline } = await import('@huggingface/transformers');
@@ -92,9 +107,7 @@ export const createEmbedder = (load: () => Promise<Pipeline>) => {
 
 const embedLocal = createEmbedder(getPipeline);
 export const embed = (texts: string[]): Promise<number[][]> =>
-  process.env.THREADSHELF_EMBEDDING_PROVIDER === 'cloudflare'
-    ? embedWithCloudflare(texts)
-    : embedLocal(texts);
+  getEmbeddingProvider() === 'cloudflare' ? embedWithCloudflare(texts) : embedLocal(texts);
 
 export interface EmbeddingLimits {
   readonly maxInputTokens: number;
@@ -103,9 +116,9 @@ export interface EmbeddingLimits {
 
 /** Use the active model's tokenizer and context limit; do not guess from characters. */
 export const getEmbeddingLimits = async (): Promise<EmbeddingLimits> => {
-  if (process.env.THREADSHELF_EMBEDDING_PROVIDER === 'cloudflare') {
+  if (getEmbeddingProvider() === 'cloudflare') {
     return {
-      maxInputTokens: CLOUDFLARE_MAX_INPUT_TOKENS,
+      maxInputTokens: getCloudflareMaxInputTokens(),
       countTokens: countCloudflareInputTokens,
     };
   }

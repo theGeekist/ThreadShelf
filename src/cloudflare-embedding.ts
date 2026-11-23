@@ -4,47 +4,149 @@ export const CLOUDFLARE_MAX_INPUT_TOKENS = 60_000;
 
 const getAccountId = (): string => process.env.CLOUDFLARE_ACCOUNT_ID?.trim() || '';
 const getApiToken = (): string => process.env.CLOUDFLARE_API_TOKEN?.trim() || '';
+const getModelId = (): string => process.env.THREADSHELF_EMBEDDING_MODEL?.trim() || MODEL_ID;
+export const getCloudflareEmbeddingDimension = (): number => {
+  const configured = Number(process.env.THREADSHELF_EMBEDDING_DIMENSION);
+  return Number.isInteger(configured) && configured > 0
+    ? configured
+    : CLOUDFLARE_EMBEDDING_DIMENSION;
+};
+export const getCloudflareMaxInputTokens = (): number => {
+  const configured = Number(process.env.THREADSHELF_EMBEDDING_MAX_INPUT_TOKENS);
+  return Number.isInteger(configured) && configured > 0 ? configured : CLOUDFLARE_MAX_INPUT_TOKENS;
+};
 
-interface WorkersAiResponse {
-  readonly success?: boolean;
-  readonly errors?: readonly { readonly message?: string }[];
-  readonly data?: readonly (readonly number[])[];
-  readonly embeddings?: readonly (readonly number[])[];
-  readonly result?: {
-    readonly data?: readonly (readonly number[])[];
-    readonly embeddings?: readonly (readonly number[])[];
-  };
+interface OpenAiEmbeddingResponse {
+  readonly data?: readonly {
+    readonly index?: number;
+    readonly embedding?: readonly number[];
+  }[];
+  readonly errors?: readonly { readonly code?: number; readonly message?: string }[];
+  readonly error?: { readonly code?: number | string; readonly message?: string };
 }
 
-const endpoint = (): string => {
-  const accountId = getAccountId();
-  if (!accountId || !getApiToken()) {
-    throw new Error('Cloudflare embeddings require CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN');
+export class CloudflareRateLimitError extends Error {
+  constructor(
+    message: string,
+    readonly retryAt: number,
+    readonly code?: number | string,
+  ) {
+    super(message);
+    this.name = 'CloudflareRateLimitError';
   }
-  return `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/ai/run/${MODEL_ID}`;
+}
+
+const apiConfig = (): { endpoint: string; model: string; token: string } => {
+  const token = getApiToken();
+  if (!token) throw new Error('Cloudflare embeddings require CLOUDFLARE_API_TOKEN');
+  const configuredBaseUrl = process.env.THREADSHELF_EMBEDDING_BASE_URL?.trim().replace(/\/+$/, '');
+  const accountId = getAccountId();
+  const baseUrl =
+    configuredBaseUrl ||
+    (accountId
+      ? `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/ai/v1`
+      : '');
+  if (!baseUrl) {
+    throw new Error(
+      'Set CLOUDFLARE_ACCOUNT_ID or THREADSHELF_EMBEDDING_BASE_URL for the OpenAI-compatible embeddings API',
+    );
+  }
+  return { endpoint: `${baseUrl}/embeddings`, model: getModelId(), token };
+};
+
+export const getCloudflareEmbeddingProfile = (): {
+  readonly endpoint: string;
+  readonly model: string;
+  readonly dimension: number;
+  readonly maxInputTokens: number;
+} => {
+  const config = apiConfig();
+  return {
+    endpoint: config.endpoint,
+    model: config.model,
+    dimension: getCloudflareEmbeddingDimension(),
+    maxInputTokens: getCloudflareMaxInputTokens(),
+  };
 };
 
 const delay = (milliseconds: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
 
-export const parseCloudflareVectors = (payload: WorkersAiResponse): number[][] => {
-  if (payload.success === false) {
-    throw new Error(
-      payload.errors
-        ?.map((error) => error.message)
-        .filter(Boolean)
-        .join('; ') || 'Workers AI request failed',
-    );
+// Cloudflare documents 3,000 text-embedding requests per minute. Pace below
+// that ceiling to leave room for other account activity and small timing drift.
+const MIN_REQUEST_INTERVAL_MS = 50;
+let nextRequestAt = 0;
+const waitForRequestSlot = async (): Promise<void> => {
+  const now = Date.now();
+  const scheduledAt = Math.max(now, nextRequestAt);
+  nextRequestAt = scheduledAt + MIN_REQUEST_INTERVAL_MS;
+  await delay(scheduledAt - now);
+};
+
+const errorDetails = (
+  payload: OpenAiEmbeddingResponse,
+): { message: string; code?: number | string } => {
+  const error = payload.error;
+  const cloudflareError = payload.errors?.[0];
+  return {
+    message:
+      error?.message ||
+      cloudflareError?.message ||
+      'Workers AI returned an unsuccessful embeddings response',
+    code: error?.code ?? cloudflareError?.code,
+  };
+};
+
+const retryAfterAt = (headerValue: string | null, now = Date.now()): number | undefined => {
+  if (!headerValue) return undefined;
+  const seconds = Number(headerValue);
+  if (Number.isFinite(seconds) && seconds >= 0) return now + seconds * 1000;
+  const date = Date.parse(headerValue);
+  return Number.isFinite(date) ? Math.max(now, date) : undefined;
+};
+
+const nextUtcMidnight = (now = Date.now()): number => {
+  const date = new Date(now);
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 1);
+};
+
+const rateLimitRetryAt = (
+  response: Response,
+  payload: OpenAiEmbeddingResponse,
+): { retryAt: number; code?: number | string; message: string } => {
+  const details = errorDetails(payload);
+  const now = Date.now();
+  const dailyQuota =
+    String(details.code) === '3036' || /daily free allocation|daily neuron/i.test(details.message);
+  const retryAt =
+    retryAfterAt(response.headers.get('retry-after'), now) ??
+    (dailyQuota ? nextUtcMidnight(now) : now + 30_000);
+  return { ...details, retryAt };
+};
+
+const parseVectors = (payload: OpenAiEmbeddingResponse, expected: number): number[][] => {
+  const rows = payload.data;
+  if (!Array.isArray(rows) || rows.length !== expected) {
+    throw new Error(`Workers AI returned ${rows?.length ?? 0} embeddings for ${expected} inputs`);
   }
-  const vectors =
-    payload.result?.data ?? payload.result?.embeddings ?? payload.data ?? payload.embeddings;
-  if (!Array.isArray(vectors) || vectors.length === 0) {
-    throw new Error('Workers AI returned no BGE-M3 vectors');
+  const sorted: (typeof rows)[number][] = Array(expected);
+  for (const row of rows) {
+    if (
+      !Number.isInteger(row.index) ||
+      row.index! < 0 ||
+      row.index! >= expected ||
+      sorted[row.index!]
+    ) {
+      throw new Error('Workers AI returned invalid or duplicate embedding indexes');
+    }
+    sorted[row.index!] = row;
   }
-  return vectors.map((vector, index) => {
-    if (!Array.isArray(vector) || vector.length !== CLOUDFLARE_EMBEDDING_DIMENSION) {
+  return sorted.map((row, index) => {
+    const vector = row.embedding;
+    const dimension = getCloudflareEmbeddingDimension();
+    if (!Array.isArray(vector) || vector.length !== dimension) {
       throw new Error(
-        `Workers AI returned an invalid vector at index ${index}; expected ${CLOUDFLARE_EMBEDDING_DIMENSION} dimensions`,
+        `Workers AI returned an invalid vector at index ${index}; expected ${dimension} dimensions`,
       );
     }
     let magnitude = 0;
@@ -62,45 +164,48 @@ export const parseCloudflareVectors = (payload: WorkersAiResponse): number[][] =
 
 export const embedWithCloudflare = async (texts: readonly string[]): Promise<number[][]> => {
   if (texts.length === 0) return [];
-  const url = endpoint();
-  for (let attempt = 0; attempt < 5; attempt++) {
+  const { endpoint, model, token } = apiConfig();
+  for (let attempt = 0; attempt < 4; attempt++) {
+    await waitForRequestSlot();
     let response: Response;
     try {
-      response = await fetch(url, {
+      response = await fetch(endpoint, {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${getApiToken()}`,
+          Authorization: `Bearer ${token}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ text: texts, truncate_inputs: false }),
+        body: JSON.stringify({ model, input: texts }),
       });
     } catch (error) {
-      if (attempt === 4) throw error;
+      if (attempt === 3) throw error;
       await delay(Math.min(1_000 * 2 ** attempt, 15_000));
       continue;
     }
 
-    if (response.ok) {
-      const vectors = parseCloudflareVectors((await response.json()) as WorkersAiResponse);
-      if (vectors.length !== texts.length) {
-        throw new Error(`Workers AI returned ${vectors.length} vectors for ${texts.length} inputs`);
-      }
-      return vectors;
+    let payload: OpenAiEmbeddingResponse;
+    try {
+      payload = (await response.json()) as OpenAiEmbeddingResponse;
+    } catch {
+      throw new Error(`Workers AI returned invalid JSON (${response.status})`);
     }
 
-    const details = (await response.text()).slice(0, 1000);
-    if ((response.status === 429 || response.status >= 500) && attempt < 4) {
-      const retryAfter = Number(response.headers.get('retry-after'));
-      await delay(
-        Number.isFinite(retryAfter) && retryAfter > 0
-          ? Math.min(retryAfter * 1000, 30_000)
-          : Math.min(1_000 * 2 ** attempt, 15_000),
-      );
+    if (response.status === 429) {
+      const { retryAt, code, message } = rateLimitRetryAt(response, payload);
+      throw new CloudflareRateLimitError(message, retryAt, code);
+    }
+    if (response.ok) return parseVectors(payload, texts.length);
+
+    const { message, code } = errorDetails(payload);
+    if (response.status >= 500 && attempt < 3) {
+      await delay(Math.min(1_000 * 2 ** attempt, 15_000));
       continue;
     }
-    throw new Error(`Workers AI ${MODEL_ID} failed (${response.status}): ${details}`);
+    throw new Error(
+      `Embedding API ${model} failed (${response.status}${code ? `, ${code}` : ''}): ${message}`,
+    );
   }
-  throw new Error(`Workers AI ${MODEL_ID} request exhausted retries`);
+  throw new Error(`Embedding API ${model} request exhausted retries`);
 };
 
 /** UTF-8 bytes conservatively bound tokenizer output for chunk splitting. */

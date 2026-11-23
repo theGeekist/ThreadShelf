@@ -1,11 +1,13 @@
 # Architecture
 
 ThreadShelf is intentionally small: one Node.js server, reusable core modules,
-local embedding by default, local vector storage, and a React browser UI.
+Cloudflare BGE-M3 embeddings by default (or local MiniLM), local vector storage,
+and a React browser UI.
 
 Conversation generation is an optional layer on top of the archive. The
-`llama.cpp` path is local; OpenRouter and the optional Cloudflare embedding
-provider send the configured request content off-device.
+`llama.cpp` path is local; OpenRouter and the default Cloudflare embedding
+provider send the configured request content off-device. Local MiniLM remains
+available through explicit configuration.
 
 ## High-Level Flow
 
@@ -14,7 +16,7 @@ Export folder
   -> src/ingest.ts
   -> src/parser.ts
   -> src/chunking.ts
-  -> src/embedding.ts (local MiniLM by default; optional Cloudflare BGE-M3)
+  -> src/embedding.ts (Cloudflare BGE-M3 by default; optional local MiniLM)
   -> src/store.ts
   -> LanceDB
   -> src/server.ts API
@@ -91,7 +93,15 @@ Native chat tool call -> write policy + vault boundary -> create/edit OR browser
 
 Archive/index recovery (`src/store.ts`):
 
-- Archive turns and their `indexPending` job commit together. The index is a
+- Every durable indexing job follows `src/index-ledger.ts`: collection, model,
+  method and scope define its identity; cursor, completion, attempts, retry time,
+  error and update time define its state. Normal indexing persists these fields
+  with `__threads` (pending status represents completion, and whole-scope
+  rebuilds restart at cursor zero); full re-embedding stores batch cursors in
+  the destination sidecar. These are storage adapters for one ledger model, so
+  jobs remain distinct across collections, embedding models and indexing
+  methods.
+- Archive turns and their pending ledger state commit together. The index is a
   recoverable projection: `local` refreshes locally authored chunks, `all`
   rebuilds a file, `delete` removes a tombstone, and `reset` rebuilds a collection.
 - Embedding runs outside the global `__threads` lock. A lazy chunk iterator uses
@@ -107,8 +117,8 @@ Archive/index recovery (`src/store.ts`):
   may have been deleted or committed. The durable pending marker keeps that
   scope out of search while recovery rebuilds it from archived turns.
 - A disconnect after archive publication does not interrupt the index commit.
-  An index failure retains the durable job with `indexAttempts`, `indexRetryAt`
-  and `indexError`; workers in the HTTP server, MCP server and CLIs retry with
+  An index failure retains the durable job with its attempts, retry time and
+  last error; workers in the HTTP server, MCP server and CLIs retry with
   15 s–1 h backoff and pause after 8 failures until the thread is edited.
   Undecodable rows are marked `invalid`, keep their raw data, and are excluded
   from search without hiding healthy conversations. Full replacements stay out
@@ -137,7 +147,8 @@ Archive/index recovery (`src/store.ts`):
 
 `src/embedding.ts`
 
-- Loads the local multilingual Xenova embedding model.
+- Uses Cloudflare BGE-M3 by default or the local multilingual Xenova model when
+  configured.
 - Exposes the active tokenizer and context bound so ingestion avoids silent
   truncation and sizes padded model batches by token slots.
 - Produces vectors for chunks and search queries.

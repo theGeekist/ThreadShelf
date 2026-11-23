@@ -12,25 +12,25 @@ LM Studio, and Grok**. Search old conversations by meaning, reopen the complete
 thread, and continue it with a local GGUF model through `llama.cpp` or the
 explicitly external OpenRouter provider.
 
-The archive pipeline—parsing, embeddings, LanceDB storage, search, HTTP API, and
-MCP—runs locally by default. Cloudflare Workers AI embeddings are an explicit
-external option. Conversation generation is optional:
+Parsing, storage, search, the HTTP API, and MCP run locally. Cloudflare Workers AI
+BGE-M3 embeddings are the default and send chunk text and semantic queries
+off-device. Set `THREADSHELF_EMBEDDING_PROVIDER=local` to keep embeddings on the
+device. Conversation generation is optional:
 `llama.cpp` stays loopback-only; switching to the clearly marked
 **OpenRouter · external** provider sends the selected user/assistant context and
 new prompt off-device.
 
-Selecting Cloudflare embeddings sends chunk text and search queries to Cloudflare
-Workers AI. Local MiniLM remains the default; Cloudflare embeddings use a separate
-index. See [Cloudflare embeddings](docs/CLOUDFLARE_EMBEDDINGS.md).
+Cloudflare uses the documented OpenAI-compatible embeddings endpoint. Embeddings
+use a separate index from local MiniLM. See [Cloudflare embeddings](docs/CLOUDFLARE_EMBEDDINGS.md).
 
 ![ThreadShelf indexing, search, and thread workflow](docs/assets/threadshelf-demo.gif)
 
-| Capability              | What ThreadShelf provides                                                                                              |
-| ----------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| **Archive & retrieval** | Multi-provider normalization, local multilingual embeddings, semantic and exact search, complete thread reconstruction |
-| **Continue & create**   | Local GGUF inference through managed `llama.cpp`, plus optional OpenRouter streaming                                   |
-| **Use it anywhere**     | React UI, command-line ingest/search, HTTP API, and an MCP stdio server over the same index                            |
-| **Keep control**        | Loopback defaults, isolated local storage, explicit off-device labeling, synthetic test data                           |
+| Capability              | What ThreadShelf provides                                                                                                               |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| **Archive & retrieval** | Multi-provider normalization, BGE-M3 embeddings by default (or local MiniLM), semantic and exact search, complete thread reconstruction |
+| **Continue & create**   | Local GGUF inference through managed `llama.cpp`, plus optional OpenRouter streaming                                                    |
+| **Use it anywhere**     | React UI, command-line ingest/search, HTTP API, and an MCP stdio server over the same index                                             |
+| **Keep control**        | Loopback defaults, local archive storage, Cloudflare transfer documented, local MiniLM option, synthetic test data                      |
 
 ---
 
@@ -44,9 +44,9 @@ index. See [Cloudflare embeddings](docs/CLOUDFLARE_EMBEDDINGS.md).
 ## What it does (in 30 seconds)
 
 1. You export/copy your chats as JSON (see [Get your data](#get-your-data)).
-2. ThreadShelf parses them into a common format, embeds them locally by default,
-   and stores them in a local vector database (LanceDB). Cloudflare Workers AI is
-   available as an explicit external embedding provider.
+2. ThreadShelf parses them into a common format, embeds them with Cloudflare
+   Workers AI by default, and stores vectors in a local LanceDB database. Set
+   `THREADSHELF_EMBEDDING_PROVIDER=local` for on-device MiniLM embeddings.
 3. You search by meaning in the web UI, open the full original thread, and export
    any conversation to Markdown — or query the same index from an MCP client.
 4. Optionally start a new chat or continue an archived thread through local
@@ -137,10 +137,10 @@ one-click connection. Search the notes locally, open the originals in Obsidian, 
 create new notes on the page. Enable **Notes tools** in a conversation to let the selected model search,
 read, create and edit notes as part of a bounded tool-calling workflow.
 
-| Direction | Available workflow |
-| --- | --- |
-| **Obsidian → ThreadShelf / AI** | Live keyword search and note reading through the UI, HTTP API and MCP, with relative source paths and original Markdown |
-| **ThreadShelf → Obsidian** | Create Markdown notes or ask the agent to write conversation summaries with source links; edit existing notes using revision checks |
+| Direction                       | Available workflow                                                                                                                  |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| **Obsidian → ThreadShelf / AI** | Live keyword search and note reading through the UI, HTTP API and MCP, with relative source paths and original Markdown             |
+| **ThreadShelf → Obsidian**      | Create Markdown notes or ask the agent to write conversation summaries with source links; edit existing notes using revision checks |
 
 **Allow vault writes** is **off by default**: a connected vault is read-only,
 including for MCP clients, until you enable writes on the Markdown/Obsidian page or beside the
@@ -392,10 +392,10 @@ directory is disposable and npm may wipe it at any time. Persistent data lives
 in a per-user directory instead, so upgrading or clearing the npm cache leaves
 your index untouched.
 
-| Platform      | Default data directory                       |
-| ------------- | -------------------------------------------- |
-| Windows       | `%LOCALAPPDATA%\ThreadShelf`                 |
-| macOS / Linux | `~/.threadshelf`                             |
+| Platform      | Default data directory       |
+| ------------- | ---------------------------- |
+| Windows       | `%LOCALAPPDATA%\ThreadShelf` |
+| macOS / Linux | `~/.threadshelf`             |
 
 Override it with `--data-dir <path>` or `THREADSHELF_DATA_DIR`, and print the
 resolved locations with `npx threadshelf --where`. The narrower overrides
@@ -448,8 +448,9 @@ finish; completed files stay searchable. While a file is being rebuilt, its old
 vectors are hidden from search. If indexing stops, the saved archive drives
 automatic recovery before that file becomes searchable again.
 
-> First indexing is slow while the local embedding model downloads once, then it's
-> cached. Working on the UI? `npm run dev` (backend) + `npm run dev:client` (Vite
+> Cloudflare embeddings need `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN`.
+> To keep inference local, set `THREADSHELF_EMBEDDING_PROVIDER=local`; the local
+> MiniLM model downloads once, then stays cached. Working on the UI? `npm run dev` (backend) + `npm run dev:client` (Vite
 > hot reload on :5173, API proxied to :3000).
 
 For scheduled local backups or headless indexing:
@@ -806,7 +807,7 @@ CI runs the full gate on Linux and lightweight core checks on Windows.
 | `npm run bench:ingest-stream`                        | Compare synthetic whole-array and streaming ingest time and memory.                 |
 | `npm run setup:llama`                                | Discover local `llama-server`; add `-- -- --check` or explicit install flags.       |
 | `npm run build:package`                              | Build the publishable package (client UI + compiled server into `dist/`).           |
-| `npm run pack:verify`                                | Pack the tarball, install it in a temp dir, and boot it (`npx` smoke test).          |
+| `npm run pack:verify`                                | Pack the tarball, install it in a temp dir, and boot it (`npx` smoke test).         |
 
 Missing Playwright browsers? `npx playwright install chromium`.
 
@@ -850,9 +851,13 @@ Missing Playwright browsers? `npx playwright install chromium`.
 | `GH_TOKEN`                                | _(empty)_                      | Alternative name for `GITHUB_TOKEN`.                                  |
 | `OPENROUTER_API_KEY`                      | _(empty)_                      | OpenRouter key; may be set in `.env`, never exposed to the browser.   |
 | `OPENROUTER_BASE_URL`                     | `https://openrouter.ai/api/v1` | Override primarily intended for testing.                              |
-| `THREADSHELF_EMBEDDING_PROVIDER`           | `local`                         | `local` MiniLM or explicit `cloudflare` BGE-M3 embeddings.             |
-| `CLOUDFLARE_ACCOUNT_ID`                    | _(empty)_                      | Account used by the optional Workers AI embedding provider.           |
-| `CLOUDFLARE_API_TOKEN`                     | _(empty)_                      | Workers AI token used for remote embeddings; keep it private.          |
+| `THREADSHELF_EMBEDDING_PROVIDER`          | `cloudflare`                   | `cloudflare` BGE-M3 or `local` MiniLM embeddings.                     |
+| `CLOUDFLARE_ACCOUNT_ID`                   | _(empty)_                      | Account for the default Workers AI embedding endpoint.                |
+| `CLOUDFLARE_API_TOKEN`                    | _(empty)_                      | Workers AI token used for remote embeddings; keep it private.         |
+| `THREADSHELF_EMBEDDING_BASE_URL`          | _(Cloudflare)_                 | Override with another OpenAI-compatible embeddings API base URL.      |
+| `THREADSHELF_EMBEDDING_MODEL`             | `@cf/baai/bge-m3`              | Embedding model ID sent using the OpenAI embeddings schema.           |
+| `THREADSHELF_EMBEDDING_DIMENSION`         | `1024`                         | Vector size for the configured model.                                 |
+| `THREADSHELF_EMBEDDING_MAX_INPUT_TOKENS`  | `60000`                        | Conservative input limit used to split new chunks.                    |
 
 Paths given as _(data dir)_ default to a location inside the data directory
 described in [Quick Start](#quick-start); setting one explicitly still wins.
@@ -880,14 +885,13 @@ local network** in the Local model API settings instead; see
 
 ## Privacy boundary
 
-Indexing, embeddings, storage, search, MCP, and llama.cpp inference are local.
-The explicitly selected **OpenRouter generation is not
-local**: it sends the selected archive or ThreadShelf chat's user/assistant
-history and prompt to OpenRouter and
-the routed provider. Two other surfaces reach the network but never carry
-conversation content: GitHub Releases for `llama.cpp` builds, and Hugging Face
-for model catalog metadata and GGUF downloads — both only after you ask for
-them. **Do not commit real chat exports, uploaded files, local
+Storage, search, MCP, and llama.cpp inference are local. **Cloudflare Workers AI
+embeddings are the default**: chunk text and semantic search queries are sent to
+Cloudflare. Set `THREADSHELF_EMBEDDING_PROVIDER=local` to use local MiniLM instead.
+The explicitly selected **OpenRouter generation** sends the selected archive or
+ThreadShelf chat's user/assistant history and prompt to OpenRouter and the routed
+provider. GitHub Releases and Hugging Face are contacted only for requested
+runtime downloads and model metadata. **Do not commit real chat exports, uploaded files, local
 databases, `.threadshelf/`, logs, or temp folders** — `.gitignore` excludes them.
 `npm run check:repo` also rejects these paths if they become commit candidates.
 Fixtures in `test/fixtures/` are synthetic and anonymized. See

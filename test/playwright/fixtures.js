@@ -28,6 +28,7 @@ export const test = base.extend({
           ...process.env,
           PORT: port,
           HOST: '127.0.0.1',
+          THREADSHELF_EMBEDDING_PROVIDER: 'local',
           LANCEDB_PATH: join(tempRoot, '.lancedb'),
           UPLOADS_DIR: join(tempRoot, '.uploads'),
           COLLECTIONS_PATH: join(tempRoot, '.collections.json'),

@@ -1,12 +1,18 @@
 import { connect, type Connection, type Table } from '@lancedb/lancedb';
 import { dataPath } from './paths.js';
-import { embed, embedOne, getEmbeddingLimits } from './embedding.js';
+import { embed, embedOne, getEmbeddingLimits, getEmbeddingModelIdentity } from './embedding.js';
 import { iterateTurnChunks, isIndexableText, splitTextByTokenBudget } from './chunking.js';
 import { streamEmbeddingsToStore } from './embedding-stream.js';
 import { validateTurns } from './validation.js';
 import type { Provider } from './parser.js';
 import { createHash } from 'node:crypto';
 import { portableModelLabel } from './model-label.js';
+import { CloudflareRateLimitError } from './cloudflare-embedding.js';
+import {
+  INDEX_METHOD_SEMANTIC,
+  createIndexLedgerCheckpoint,
+  indexLedgerKey,
+} from './index-ledger.js';
 
 const DB_PATH = process.env.LANCEDB_PATH || dataPath('lancedb');
 const EMBED_BATCH_SIZE = Math.max(1, Number(process.env.EMBED_BATCH_SIZE) || 25);
@@ -191,6 +197,9 @@ export interface StoredThreadRow {
   readonly threadCreatedAt: string;
   readonly hasThreadShelfTurns: boolean;
   readonly indexPending: string;
+  readonly indexModel: string;
+  readonly indexMethod: string;
+  readonly indexUpdatedAt: string;
 }
 
 export interface ThreadSummaryRow {
@@ -230,6 +239,9 @@ const storedThreadRow = (row: Record<string, unknown>): StoredThreadRow => ({
   threadCreatedAt: (row.threadCreatedAt as string) ?? '',
   hasThreadShelfTurns: Boolean(row.hasThreadShelfTurns || row.createdInThreadShelf),
   indexPending: String(row.indexPending || ''),
+  indexModel: String(row.indexModel || ''),
+  indexMethod: String(row.indexMethod || ''),
+  indexUpdatedAt: String(row.indexUpdatedAt || ''),
 });
 
 // Latest turn timestamp in a conversation — powers "sort by recent" in the
@@ -250,6 +262,12 @@ const latestTurnModel = (turns: readonly unknown[]): string => {
   }
   return '';
 };
+
+const activeIndexLedgerFields = (): Record<string, unknown> => ({
+  indexModel: getEmbeddingModelIdentity(),
+  indexMethod: INDEX_METHOD_SEMANTIC,
+  indexUpdatedAt: new Date().toISOString(),
+});
 
 let threadsSchemaMigration: Promise<void> | null = null;
 
@@ -277,6 +295,9 @@ const migrateThreadsSchema = async (tbl: Table): Promise<void> => {
     { name: 'hasThreadShelfTurns', valueSql: 'false' },
     { name: 'lastModel', valueSql: "''" },
     { name: 'indexPending', valueSql: "''" },
+    { name: 'indexModel', valueSql: "''" },
+    { name: 'indexMethod', valueSql: "''" },
+    { name: 'indexUpdatedAt', valueSql: "''" },
     { name: 'indexAttempts', valueSql: '0.0' },
     { name: 'indexRetryAt', valueSql: '0.0' },
     { name: 'indexError', valueSql: "''" },
@@ -344,6 +365,8 @@ const threadRows = (
     createdInThreadShelf: conversation.createdInThreadShelf ?? false,
     threadCreatedAt: conversation.threadCreatedAt ?? '',
     indexPending,
+    ...activeIndexLedgerFields(),
+    indexUpdatedAt: ingestedAt,
     indexAttempts: 0,
     indexRetryAt: 0,
     indexError: '',
@@ -421,6 +444,8 @@ export const updateStoredThread = async (
         turnsJson: JSON.stringify(conversation.turns),
         ingestedAt,
         indexPending: current[0]?.indexPending === 'all' ? 'all' : 'local',
+        ...activeIndexLedgerFields(),
+        indexUpdatedAt: ingestedAt,
         indexAttempts: 0,
         indexRetryAt: 0,
         indexError: '',
@@ -472,6 +497,7 @@ export const updateStoredThreadFromCurrent = async (
         turnsJson: JSON.stringify(conversation.turns),
         ingestedAt: new Date().toISOString(),
         indexPending: rows[0].indexPending === 'all' ? 'all' : 'local',
+        ...activeIndexLedgerFields(),
         indexAttempts: 0,
         indexRetryAt: 0,
         indexError: '',
@@ -755,6 +781,7 @@ export const replaceImportedFiles = async (
               ...old,
               conversationKey: `${conversation.key}:threadshelf:${suffix}`,
               indexPending: 'all',
+              ...activeIndexLedgerFields(),
             });
             return conversation;
           }
@@ -776,7 +803,7 @@ export const replaceImportedFiles = async (
           )
         )
           continue;
-        next.push({ ...old, indexPending: 'all' });
+        next.push({ ...old, indexPending: 'all', ...activeIndexLedgerFields() });
       }
       const invalid = invalidThreadRows(next);
       const resetMarker = options.clearFirst
@@ -842,6 +869,7 @@ const acknowledgeIndexLocked = async (
         indexError: 'Stored turns could not be decoded; original data retained',
         indexAttempts: 1,
         indexRetryAt: 0,
+        indexUpdatedAt: new Date().toISOString(),
       },
     });
   }
@@ -852,7 +880,13 @@ const acknowledgeIndexLocked = async (
   await tbl.delete(`(${where}) AND indexPending IN ('delete', 'reset')`);
   await tbl.update({
     where: `(${where}) AND indexPending NOT IN ('', 'invalid')`,
-    values: { indexPending: '', indexAttempts: 0, indexRetryAt: 0, indexError: '' },
+    values: {
+      indexPending: '',
+      indexAttempts: 0,
+      indexRetryAt: 0,
+      indexError: '',
+      indexUpdatedAt: new Date().toISOString(),
+    },
   });
 };
 
@@ -906,17 +940,23 @@ export const indexStoredFile = async (
         await withCollectionWriteLock(THREADS_TABLE, async () => {
           if (snapshotFingerprint(rows) !== snapshotFingerprint(await readThreadScope(where)))
             return;
-          const attempts = Math.max(0, ...rows.map((row) => Number(row.indexAttempts) || 0)) + 1;
+          const rateLimited = error instanceof CloudflareRateLimitError;
+          const attempts = rateLimited
+            ? 0
+            : Math.max(0, ...rows.map((row) => Number(row.indexAttempts) || 0)) + 1;
           const tbl = await openTable(THREADS_TABLE);
           await tbl?.update({
             where: `(${where}) AND indexPending NOT IN ('', 'invalid')`,
             values: {
               indexAttempts: attempts,
-              indexRetryAt: Date.now() + Math.min(15_000 * 2 ** (attempts - 1), 3_600_000),
+              indexRetryAt: rateLimited
+                ? Math.max(Date.now(), error.retryAt)
+                : Date.now() + Math.min(15_000 * 2 ** (attempts - 1), 3_600_000),
               indexError: (error instanceof Error ? error.message : 'Indexing failed').slice(
                 0,
                 500,
               ),
+              ...activeIndexLedgerFields(),
             },
           });
         });
@@ -950,7 +990,16 @@ export const recoverPendingIndexes = (
     const rows = await tbl
       .query()
       .where("indexPending NOT IN ('', 'invalid')")
-      .select(['collection', 'sourceFile', 'indexPending', 'indexAttempts', 'indexRetryAt'])
+      .select([
+        'collection',
+        'sourceFile',
+        'indexPending',
+        'indexModel',
+        'indexMethod',
+        'indexAttempts',
+        'indexRetryAt',
+        'indexError',
+      ])
       .limit(Number.MAX_SAFE_INTEGER)
       .toArray();
     const resets = new Set(
@@ -964,10 +1013,18 @@ export const recoverPendingIndexes = (
         row.collection !== options.collection
       )
         continue;
-      const key = JSON.stringify([
-        row.collection,
-        resets.has(row.collection) ? null : row.sourceFile,
-      ]);
+      const identity = {
+        collection: String(row.collection),
+        model: String(row.indexModel || getEmbeddingModelIdentity()),
+        method: String(row.indexMethod || INDEX_METHOD_SEMANTIC),
+      };
+      const scope = resets.has(row.collection) ? '*' : String(row.sourceFile);
+      const checkpoint = createIndexLedgerCheckpoint(identity, scope, {
+        attempts: Number(row.indexAttempts) || 0,
+        retryAt: Number(row.indexRetryAt) || 0,
+        error: String(row.indexError || ''),
+      });
+      const key = indexLedgerKey(checkpoint, scope);
       jobs.set(key, [...(jobs.get(key) ?? []), row]);
     }
     for (const job of jobs.values()) {
