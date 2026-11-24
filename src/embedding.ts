@@ -3,6 +3,8 @@ import {
   countCloudflareInputTokens,
   embedWithCloudflare,
   getCloudflareEmbeddingDimension,
+  getCloudflareEndpointIdentity,
+  getCloudflareModelId,
   getCloudflareMaxInputTokens,
 } from './cloudflare-embedding.js';
 
@@ -46,9 +48,8 @@ export const getEmbeddingModelIdentity = (): string =>
   getEmbeddingProvider() === 'cloudflare'
     ? JSON.stringify({
         provider: 'cloudflare-openai-compatible',
-        endpoint:
-          process.env.THREADSHELF_EMBEDDING_BASE_URL?.trim().replace(/\/+$/, '') || 'cloudflare',
-        model: process.env.THREADSHELF_EMBEDDING_MODEL?.trim() || '@cf/baai/bge-m3',
+        endpoint: getCloudflareEndpointIdentity(),
+        model: getCloudflareModelId(),
         dimension: getCloudflareEmbeddingDimension(),
         maxInputTokens: getCloudflareMaxInputTokens(),
       })

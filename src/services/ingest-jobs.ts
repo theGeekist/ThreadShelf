@@ -29,6 +29,8 @@ let jobs: StoredJobs | undefined;
 let loadPromise: Promise<void> | undefined;
 let writes = Promise.resolve();
 let startingJob = false;
+const MAX_SELECTED_FILES = 400;
+const MAX_SELECTED_FILE_PATH_LENGTH = 512;
 
 class JobPersistenceError extends Error {
   constructor(cause: unknown) {
@@ -98,7 +100,11 @@ const load = async (): Promise<void> => {
         }
       }
       if (Object.values(jobs).some((job) => job.state === 'interrupted')) await persist(jobs);
-    })();
+    })().catch((error) => {
+      loadPromise = undefined;
+      jobs = undefined;
+      throw error;
+    });
   }
   await loadPromise;
 };
@@ -110,13 +116,23 @@ const requireJob = async (id: string): Promise<IngestJob> => {
   return job;
 };
 
-const resultSummary = (current: IngestResult | undefined, next: IngestResult): IngestResult => ({
+const resultSummary = (
+  current: IngestResult | undefined,
+  next: IngestResult,
+  retriedFile: string,
+): IngestResult => ({
   conversations: (current?.conversations ?? 0) + next.conversations,
   ingested: (current?.ingested ?? 0) + next.ingested,
   totalTokens: (current?.totalTokens ?? 0) + next.totalTokens,
-  files: [...(current?.files ?? []), ...next.files],
-  errors: [...(current?.errors ?? []), ...next.errors],
-  skippedFiles: [...(current?.skippedFiles ?? []), ...(next.skippedFiles ?? [])],
+  files: [...(current?.files ?? []).filter((file) => file !== retriedFile), ...next.files],
+  errors: [
+    ...(current?.errors ?? []).filter((error) => !error.startsWith(`${retriedFile}:`)),
+    ...next.errors,
+  ],
+  skippedFiles: [
+    ...(current?.skippedFiles ?? []).filter((file) => file !== retriedFile),
+    ...(next.skippedFiles ?? []),
+  ],
   providers: Object.fromEntries(
     [...new Set([...Object.keys(current?.providers ?? {}), ...Object.keys(next.providers)])].map(
       (provider) => [
@@ -132,6 +148,33 @@ const runJob = async (id: string): Promise<void> => {
   const controller = controllers.get(id)!;
   try {
     let job = await requireJob(id);
+    let pendingProgress: ProgressEvent | undefined;
+    let progressTimer: ReturnType<typeof setTimeout> | undefined;
+    let progressWrites = Promise.resolve();
+    const flushProgress = async (): Promise<void> => {
+      if (progressTimer) clearTimeout(progressTimer);
+      progressTimer = undefined;
+      const progress = pendingProgress;
+      pendingProgress = undefined;
+      if (progress) {
+        progressWrites = progressWrites
+          .catch(() => {})
+          .then(async () => {
+            const active = jobs?.[job.collection];
+            if (active?.id === id) await save({ ...active, progress });
+          });
+      }
+      await progressWrites.catch((error) => console.error('[ingest-job:progress]', error));
+    };
+    const scheduleProgress = (progress: ProgressEvent): void => {
+      pendingProgress = progress;
+      if (!progressTimer) {
+        progressTimer = setTimeout(() => {
+          progressTimer = undefined;
+          void flushProgress();
+        }, 300);
+      }
+    };
     while (!controller.signal.aborted) {
       const nextIndex = job.files.findIndex((file) => file.state === 'pending');
       if (nextIndex < 0) break;
@@ -160,9 +203,10 @@ const runJob = async (id: string): Promise<void> => {
                 Math.max(active.files.length, 1),
               currentFile: current.path,
             };
-            void save({ ...active, progress: mapped }).catch(() => {});
+            scheduleProgress(mapped);
           },
         });
+        await flushProgress();
         const failed = result.errors.length > 0 || result.replacementSkipped === true;
         const active = jobs![job.collection]!;
         const latest: IngestJob = {
@@ -178,11 +222,12 @@ const runJob = async (id: string): Promise<void> => {
                 : { path: file.path, state: 'completed' }
               : file,
           ),
-          result: resultSummary(active.result, result),
+          result: resultSummary(active.result, result, current.path),
         };
         await save(latest);
         job = latest;
       } catch (error) {
+        await flushProgress();
         if (error instanceof JobPersistenceError) throw error;
         if (controller.signal.aborted) break;
         const active = jobs![job.collection]!;
@@ -198,6 +243,7 @@ const runJob = async (id: string): Promise<void> => {
         await save(job);
       }
     }
+    await flushProgress();
   } finally {
     try {
       const job = await requireJob(id);
@@ -254,7 +300,17 @@ const runJob = async (id: string): Promise<void> => {
 
 export const getIngestJob = async (collection: string): Promise<IngestJob | null> => {
   await load();
-  return jobs![collection] ?? null;
+  if (!Object.hasOwn(jobs!, collection)) return null;
+  const job = jobs![collection]!;
+  return workers.has(job.id) && job.state !== 'running' ? { ...job, state: 'running' } : job;
+};
+
+const reserveWorkerSlot = (): void => {
+  if (workers.size > 0 || startingJob)
+    throw Object.assign(new Error('Another saved indexing job is already running'), {
+      status: 409,
+    });
+  startingJob = true;
 };
 
 export const createIngestJob = async (
@@ -263,21 +319,24 @@ export const createIngestJob = async (
   selectedFiles: readonly string[],
 ): Promise<IngestJob> => {
   await load();
-  if (workers.size > 0 || startingJob)
-    throw Object.assign(new Error('Another saved indexing job is already running'), {
-      status: 409,
-    });
-  startingJob = true;
+  reserveWorkerSlot();
   try {
     if (
       !Array.isArray(selectedFiles) ||
       selectedFiles.length === 0 ||
-      selectedFiles.length > 10_000 ||
-      selectedFiles.some((file) => typeof file !== 'string' || file.length > 4096)
+      selectedFiles.length > MAX_SELECTED_FILES ||
+      selectedFiles.some(
+        (file) => typeof file !== 'string' || file.length > MAX_SELECTED_FILE_PATH_LENGTH,
+      )
     ) {
-      throw Object.assign(new Error('selectedFiles must contain 1 to 10000 file paths'), {
-        status: 400,
-      });
+      throw Object.assign(
+        new Error(
+          `selectedFiles must contain 1 to ${MAX_SELECTED_FILES} paths no longer than ${MAX_SELECTED_FILE_PATH_LENGTH} characters`,
+        ),
+        {
+          status: 400,
+        },
+      );
     }
     const resolvedFolder = resolve(folderPath);
     const available = await listExportFiles(resolvedFolder);
@@ -288,7 +347,7 @@ export const createIngestJob = async (
         status: 400,
       });
     }
-    const previous = jobs![collection];
+    const previous = Object.hasOwn(jobs!, collection) ? jobs![collection] : undefined;
     if (previous?.state === 'running')
       throw Object.assign(new Error('An indexing job for this collection is already running'), {
         status: 409,
@@ -315,30 +374,36 @@ export const createIngestJob = async (
 export const stopIngestJob = async (id: string): Promise<IngestJob> => {
   const job = await requireJob(id);
   if (job.state !== 'running') return job;
+  if (job.files.every((file) => file.state === 'completed' || file.state === 'failed')) {
+    await workers.get(id);
+    return requireJob(id);
+  }
   controllers.get(id)?.abort(new DOMException('Indexing stopped', 'AbortError'));
   await workers.get(id);
   return requireJob(id);
 };
 
 export const continueIngestJob = async (id: string): Promise<IngestJob> => {
-  const job = await requireJob(id);
-  if (workers.size > 0)
-    throw Object.assign(new Error('Another saved indexing job is already running'), {
-      status: 409,
-    });
-  if (job.state === 'running')
-    throw Object.assign(new Error('Indexing job is already running'), { status: 409 });
-  const files = job.files.map((file) =>
-    file.state === 'failed' ? { path: file.path, state: 'pending' as const } : file,
-  );
-  if (!files.some((file) => file.state === 'pending'))
-    throw Object.assign(new Error('No files remain to index'), { status: 409 });
-  const continued = { ...job, state: 'running' as const, files };
-  await save(continued);
-  const controller = new AbortController();
-  controllers.set(id, controller);
-  const worker = runJob(id);
-  workers.set(id, worker);
-  void worker.catch((error) => console.error('[ingest-job]', error));
-  return continued;
+  await load();
+  reserveWorkerSlot();
+  try {
+    const job = await requireJob(id);
+    if (job.state === 'running')
+      throw Object.assign(new Error('Indexing job is already running'), { status: 409 });
+    const files = job.files.map((file) =>
+      file.state === 'failed' ? { path: file.path, state: 'pending' as const } : file,
+    );
+    if (!files.some((file) => file.state === 'pending'))
+      throw Object.assign(new Error('No files remain to index'), { status: 409 });
+    const continued = { ...job, state: 'running' as const, files };
+    await save(continued);
+    const controller = new AbortController();
+    controllers.set(id, controller);
+    const worker = runJob(id);
+    workers.set(id, worker);
+    void worker.catch((error) => console.error('[ingest-job]', error));
+    return continued;
+  } finally {
+    startingJob = false;
+  }
 };

@@ -11,7 +11,8 @@ it('reads one verified image and rejects missing, ambiguous, oversized and non-i
   try {
     const archive = new AdmZip();
     const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3]);
-    archive.addFile('file-good-image.dat', png);
+    archive.addFile('file-good.dat', png);
+    archive.addFile('file-a-b.dat', png);
     archive.addFile('file-dupe-one.dat', png);
     archive.addFile('file-dupe-two.dat', png);
     archive.addFile('file-text.dat', Buffer.from('not an image'));
@@ -23,6 +24,7 @@ it('reads one verified image and rejects missing, ambiguous, oversized and non-i
     assert.deepEqual(image.data, png);
     await assert.rejects(readChatGptImage(path, 'file-dupe'), /ambiguous/);
     await assert.rejects(readChatGptImage(path, 'file-missing'), /not in the export/);
+    await assert.rejects(readChatGptImage(path, 'file-a'), /not in the export/);
     await assert.rejects(readChatGptImage(path, '../escape'), /Invalid attachment ID/);
     await assert.rejects(readChatGptImage(path, 'file-text'), /not a supported image/);
     await assert.rejects(readChatGptImage(path, 'file-big'), /8 MiB/);

@@ -169,6 +169,36 @@ describe('semantic search filters cover the whole collection', () => {
   });
 });
 
+test('local-only pending rebuild hides generated rows while keeping imported vectors searchable', async () => {
+  await db.createTable('__threads', [
+    {
+      collection: 'pending_local',
+      sourceFile: 'pending.json',
+      conversationKey: 'pending-chat',
+      indexPending: 'local',
+    },
+  ]);
+  await db.createTable('pending_local', [
+    {
+      ...chunk(0),
+      id: 'imported-row',
+      sourceFile: 'pending.json',
+      document: 'Imported archived content remains available',
+      createdInThreadShelf: false,
+    },
+    {
+      ...chunk(1),
+      id: 'generated-row',
+      sourceFile: 'pending.json',
+      document: 'Partially rebuilt local generated content',
+      createdInThreadShelf: true,
+    },
+  ]);
+
+  const rows = await searchCollection('pending_local', 'query', { n: 5 }, QUERY);
+  assert.deepEqual(ids(rows), ['imported-row']);
+});
+
 describe('keyword search ranks every match', () => {
   it('ranks the row with the most occurrences first even when it is stored last', async () => {
     const rows = await keywordSearchCollection('keyword_late', 'NEEDLE', { n: 3 });

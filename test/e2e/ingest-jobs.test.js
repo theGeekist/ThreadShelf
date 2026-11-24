@@ -68,22 +68,23 @@ test('saved ingest job validates selections, persists progress, and retries fail
     assert.equal(persisted[collection].id, started.id);
     if (process.platform !== 'win32') assert.equal((await stat(jobPath)).mode & 0o777, 0o600);
 
+    await copyFile(join(repoRoot, 'test', 'fixtures', 'anthropic-polish.json'), invalidPath);
     const continued = await fetch(`${ctx.baseUrl}/api/ingest-jobs/${started.id}/continue`, {
       method: 'POST',
     });
     assert.equal(continued.status, 200);
     assert.equal((await continued.json()).job.state, 'running');
 
-    const retried = await waitForJob(
-      ctx.baseUrl,
-      collection,
-      (job) => job?.state === 'completed_with_errors',
-    );
+    const retried = await waitForJob(ctx.baseUrl, collection, (job) => job?.state === 'completed');
     const retriedFiles = Object.fromEntries(
       retried.files.map((file) => [basename(file.path), file]),
     );
     assert.equal(retriedFiles['valid.json'].state, 'completed');
-    assert.equal(retriedFiles['invalid.json'].state, 'failed');
+    assert.equal(retriedFiles['invalid.json'].state, 'completed');
+    assert.equal(
+      (retried.result?.errors ?? []).some((error) => error.includes(invalidPath)),
+      false,
+    );
   } finally {
     await ctx.stop();
   }

@@ -293,13 +293,15 @@ by the user.
 
 ## Embeddings
 
-The app uses:
-
-```text
-Xenova/paraphrase-multilingual-MiniLM-L12-v2
-```
-
-This is a local multilingual model. The first run may be slower because model files need to download/cache.
+Semantic indexing and search use Cloudflare Workers AI with BAAI BGE-M3 by
+default. Text chunks and semantic queries are sent to the configured
+OpenAI-compatible embeddings endpoint. Set
+`THREADSHELF_EMBEDDING_PROVIDER=local` to use the local multilingual model
+`Xenova/paraphrase-multilingual-MiniLM-L12-v2`; its files are downloaded and
+cached on first use. The two models produce different vector spaces. ThreadShelf
+checks each collection's stored model and dimension before indexing or search.
+See [Cloudflare embeddings](CLOUDFLARE_EMBEDDINGS.md) for privacy, configuration,
+and migration details.
 
 ## API Surface
 

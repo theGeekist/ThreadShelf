@@ -20,8 +20,10 @@ device. Conversation generation is optional:
 **OpenRouter · external** provider sends the selected user/assistant context and
 new prompt off-device.
 
-Cloudflare uses the documented OpenAI-compatible embeddings endpoint. Embeddings
-use a separate index from local MiniLM. See [Cloudflare embeddings](docs/CLOUDFLARE_EMBEDDINGS.md).
+Cloudflare uses the documented OpenAI-compatible embeddings endpoint. Its vectors
+cannot be mixed with local MiniLM vectors; existing archives need a separate
+Cloudflare index before switching providers. See
+[Cloudflare embeddings](docs/CLOUDFLARE_EMBEDDINGS.md).
 
 ![ThreadShelf indexing, search, and thread workflow](docs/assets/threadshelf-demo.gif)
 
@@ -59,7 +61,7 @@ flowchart LR
   exports["AI chat exports"] --> parser["Provider parsers"]
   parser --> turns["Normalized turns"]
   turns --> chunks["Chunks"]
-  chunks --> embed["Local embeddings"]
+  chunks --> embed["Cloudflare embeddings (default)<br/>Local MiniLM (optional)"]
   embed --> db[("LanceDB + thread store")]
   db --> ui["React UI"]
   db --> api["HTTP API"]
@@ -68,6 +70,12 @@ flowchart LR
   generation --> llama["llama.cpp<br/>local GGUF"]
   generation -. "explicit off-device provider" .-> openrouter["OpenRouter"]
 ```
+
+Cloudflare and MiniLM vectors are not interchangeable. The default database path
+is shared, so an existing MiniLM database is rejected when Cloudflare is
+selected. Re-embed into a separate database and set `LANCEDB_PATH` to that
+database before switching an existing archive to Cloudflare. See the
+[Cloudflare embeddings guide](docs/CLOUDFLARE_EMBEDDINGS.md).
 
 ## How is this different from other history viewers?
 

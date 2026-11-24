@@ -5,6 +5,28 @@ export const CLOUDFLARE_MAX_INPUT_TOKENS = 60_000;
 const getAccountId = (): string => process.env.CLOUDFLARE_ACCOUNT_ID?.trim() || '';
 const getApiToken = (): string => process.env.CLOUDFLARE_API_TOKEN?.trim() || '';
 const getModelId = (): string => process.env.THREADSHELF_EMBEDDING_MODEL?.trim() || MODEL_ID;
+const normalizedBaseUrl = (): string =>
+  process.env.THREADSHELF_EMBEDDING_BASE_URL?.trim().replace(/\/+$/, '') || '';
+export const getCloudflareModelId = getModelId;
+export const getCloudflareEndpointIdentity = (): string => {
+  const configuredBaseUrl = normalizedBaseUrl();
+  if (configuredBaseUrl) {
+    try {
+      const endpoint = new URL(configuredBaseUrl);
+      endpoint.username = '';
+      endpoint.password = '';
+      endpoint.search = '';
+      endpoint.hash = '';
+      return endpoint.toString().replace(/\/+$/, '');
+    } catch {
+      return 'custom-endpoint';
+    }
+  }
+  const accountId = getAccountId();
+  return accountId
+    ? `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/ai/v1`
+    : 'cloudflare';
+};
 export const getCloudflareEmbeddingDimension = (): number => {
   const configured = Number(process.env.THREADSHELF_EMBEDDING_DIMENSION);
   return Number.isInteger(configured) && configured > 0
@@ -39,7 +61,7 @@ export class CloudflareRateLimitError extends Error {
 const apiConfig = (): { endpoint: string; model: string; token: string } => {
   const token = getApiToken();
   if (!token) throw new Error('Cloudflare embeddings require CLOUDFLARE_API_TOKEN');
-  const configuredBaseUrl = process.env.THREADSHELF_EMBEDDING_BASE_URL?.trim().replace(/\/+$/, '');
+  const configuredBaseUrl = normalizedBaseUrl();
   const accountId = getAccountId();
   const baseUrl =
     configuredBaseUrl ||
@@ -85,6 +107,7 @@ const waitForRequestSlot = async (): Promise<void> => {
 
 const errorDetails = (
   payload: OpenAiEmbeddingResponse,
+  fallbackMessage?: string,
 ): { message: string; code?: number | string } => {
   const error = payload.error;
   const cloudflareError = payload.errors?.[0];
@@ -92,6 +115,7 @@ const errorDetails = (
     message:
       error?.message ||
       cloudflareError?.message ||
+      fallbackMessage ||
       'Workers AI returned an unsuccessful embeddings response',
     code: error?.code ?? cloudflareError?.code,
   };
@@ -183,20 +207,38 @@ export const embedWithCloudflare = async (texts: readonly string[]): Promise<num
       continue;
     }
 
-    let payload: OpenAiEmbeddingResponse;
-    try {
-      payload = (await response.json()) as OpenAiEmbeddingResponse;
-    } catch {
-      throw new Error(`Workers AI returned invalid JSON (${response.status})`);
-    }
-
     if (response.status === 429) {
+      let body = '';
+      try {
+        body = await response.text();
+      } catch {
+        // Retry-After remains available even if the body stream fails.
+      }
+      let payload: OpenAiEmbeddingResponse = {};
+      try {
+        payload = JSON.parse(body) as OpenAiEmbeddingResponse;
+      } catch {
+        // Retry-After remains authoritative even when a proxy returns plain text.
+      }
       const { retryAt, code, message } = rateLimitRetryAt(response, payload);
       throw new CloudflareRateLimitError(message, retryAt, code);
     }
+
+    let body: string;
+    try {
+      body = await response.text();
+    } catch {
+      body = '';
+    }
+    let payload: OpenAiEmbeddingResponse = {};
+    try {
+      payload = JSON.parse(body) as OpenAiEmbeddingResponse;
+    } catch {
+      if (response.ok) throw new Error(`Workers AI returned invalid JSON (${response.status})`);
+    }
     if (response.ok) return parseVectors(payload, texts.length);
 
-    const { message, code } = errorDetails(payload);
+    const { message, code } = errorDetails(payload, body.trim().slice(0, 500));
     if (response.status >= 500 && attempt < 3) {
       await delay(Math.min(1_000 * 2 ** attempt, 15_000));
       continue;

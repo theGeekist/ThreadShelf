@@ -139,19 +139,32 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
   const [copied, setCopied] = useState('');
   const pickerRef = useRef<HTMLInputElement>(null);
   const indexingController = useRef<AbortController | null>(null);
-  const restoredJob = useRef(false);
+  const targetCollectionRef = useRef(targetColl);
+  const draftRevision = useRef(0);
+  const draftDirty = useRef(false);
+  const restoredJobs = useRef(new Set<string>());
 
   const refreshJob = useCallback(
     async (signal?: AbortSignal) => {
+      const lookupCollection = targetColl;
+      const lookupRevision = draftRevision.current;
       try {
-        const response = await api.ingestJob(targetColl, signal);
+        const response = await api.ingestJob(lookupCollection, signal);
+        if (targetCollectionRef.current !== lookupCollection) return;
         setJob(response.job);
-        if (response.job && !restoredJob.current) {
-          restoredJob.current = true;
+        if (
+          response.job &&
+          !restoredJobs.current.has(lookupCollection) &&
+          !draftDirty.current &&
+          draftRevision.current === lookupRevision
+        ) {
+          restoredJobs.current.add(lookupCollection);
           setPath(response.job.folderPath);
           setPreview(
             response.job.files.map((file) => ({
-              name: file.path.replace(/\\/g, '/').split('/').pop() ?? file.path,
+              name: file.path
+                .replace(/\\/g, '/')
+                .replace(`${response.job!.folderPath.replace(/\\/g, '/')}/`, ''),
               ok: true,
               sourcePath: file.path,
               note: file.state === 'failed' ? 'failed' : '',
@@ -189,6 +202,7 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
         const response = await api.ingestJob(job.collection);
         if (!active) return;
         setJob(response.job);
+        if (response.job && response.job.state !== 'running') void onRefresh();
       } catch (e) {
         const status =
           typeof e === 'object' && e !== null && 'status' in e ? Number(e.status) : undefined;
@@ -205,7 +219,7 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
       active = false;
       if (timer) clearTimeout(timer);
     };
-  }, [job?.id, job?.collection, job?.state]);
+  }, [job?.id, job?.collection, job?.state, onRefresh]);
 
   const copyScript = useCallback(async (file: string) => {
     try {
@@ -227,6 +241,8 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
   const applyPickedFiles = useCallback((files: readonly RelativeFile[]) => {
     if (!files.length) return;
 
+    draftRevision.current++;
+    draftDirty.current = true;
     setUploadFiles([...files]);
     setPath('');
     const first = relativePathOf(files[0]!).replace(/\\/g, '/');
@@ -237,7 +253,7 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
       files.map((f) => {
         const relPath = relativePathOf(f);
         return {
-          name: relPath.replace(/\\/g, '/').split('/').pop() ?? '',
+          name: relPath.replace(/\\/g, '/'),
           ok: isPotentialExport(relPath),
           sourcePath: relPath,
         };
@@ -281,6 +297,8 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
 
   const onUsePath = useCallback(async () => {
     if (!path.trim()) return;
+    draftRevision.current++;
+    draftDirty.current = true;
     setPickedLabel('Checking…');
     try {
       const d = await api.ingestPreview(path, targetColl);
@@ -293,7 +311,11 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
       );
       setPreview(
         d.files.map((f) => {
-          const name = String(f).replace(/\\/g, '/').split('/').pop() ?? '';
+          const normalized = String(f).replace(/\\/g, '/');
+          const root = path.replace(/[\\/]+$/, '').replace(/\\/g, '/');
+          const name = normalized.startsWith(`${root}/`)
+            ? normalized.slice(root.length + 1)
+            : normalized;
           return {
             name,
             ok: true,
@@ -311,6 +333,11 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
   const doIndex = useCallback(async () => {
     const useUpload = uploadFiles && supported.length > 0;
     let coll = targetColl;
+
+    if (useUpload && !supported.some((file) => selectedPaths.has(relativePathOf(file)))) {
+      setStatusMsg({ type: 'err', text: 'Select at least one supported file to upload.' });
+      return;
+    }
 
     if (useUpload && coll === 'chunks') {
       const first = relativePathOf(uploadFiles[0]!).replace(/\\/g, '/');
@@ -336,6 +363,7 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
       try {
         const response = await api.startIngestJob(path, coll, selected);
         setJob(response.job);
+        targetCollectionRef.current = coll;
         setTargetColl(coll);
         setStatusMsg({
           type: 'info',
@@ -479,6 +507,7 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
   };
 
   const selectablePreview = preview?.filter((file) => file.ok && file.sourcePath) ?? [];
+  const selectionLocked = clearFirst && !uploadFiles;
   const allPreviewSelected =
     selectablePreview.length > 0 &&
     selectablePreview.every((file) => selectedPaths.has(file.sourcePath!));
@@ -632,7 +661,11 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
           <input
             type="text"
             value={path}
-            onChange={(e) => setPath(e.target.value)}
+            onChange={(e) => {
+              draftRevision.current++;
+              draftDirty.current = true;
+              setPath(e.target.value);
+            }}
             placeholder="/absolute/path/to/exports"
           />
           <button className="btn" onClick={onUsePath} disabled={!path}>
@@ -646,7 +679,11 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
         <select
           id="targetCollectionSelect"
           value={targetColl}
-          onChange={(e) => setTargetColl(e.target.value)}
+          onChange={(e) => {
+            draftRevision.current++;
+            targetCollectionRef.current = e.target.value;
+            setTargetColl(e.target.value);
+          }}
           className="btn sm"
           style={{ padding: '0 8px', background: 'var(--bg-2)' }}
         >
@@ -672,6 +709,9 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
           />{' '}
           Clear collection first
         </label>
+        {selectionLocked && (
+          <span className="desc">Every supported file in the folder will be replaced.</span>
+        )}
         <button
           id="ingestBtn"
           className="btn primary"
@@ -697,14 +737,16 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
           <div className="panel-head">
             <h3>Ingest preview</h3>
             <span className="sub">
-              {selectedPaths.size} selected · {preview.filter((f) => f.ok).length} supported ·{' '}
-              {preview.filter((f) => !f.ok).length} skipped
+              {selectionLocked ? 'Whole folder' : `${selectedPaths.size} selected`} ·{' '}
+              {preview.filter((f) => f.ok).length} supported · {preview.filter((f) => !f.ok).length}{' '}
+              skipped
             </span>
           </div>
           {selectablePreview.length > 0 && (
             <label className="preview-select-all">
               <input
                 type="checkbox"
+                disabled={selectionLocked}
                 checked={allPreviewSelected}
                 onChange={() =>
                   setSelectedPaths(
@@ -714,7 +756,9 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
                   )
                 }
               />{' '}
-              Select all supported files
+              {selectionLocked
+                ? 'Clear collection uses the whole folder'
+                : 'Select all supported files'}
             </label>
           )}
           <div style={{ maxHeight: 260, overflow: 'auto' }}>
@@ -734,7 +778,7 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
                 <input
                   type="checkbox"
                   aria-label={`Select ${f.name}`}
-                  disabled={!f.ok || !f.sourcePath}
+                  disabled={!f.ok || !f.sourcePath || selectionLocked}
                   checked={!!f.sourcePath && selectedPaths.has(f.sourcePath)}
                   onChange={() => f.sourcePath && togglePath(f.sourcePath)}
                 />
@@ -880,6 +924,8 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
           open
           onClose={() => setNewCollOpen(false)}
           onCreated={(name) => {
+            draftRevision.current++;
+            targetCollectionRef.current = name;
             setTargetColl(name);
             void onRefresh();
           }}

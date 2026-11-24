@@ -15,11 +15,7 @@ import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { portableModelLabel } from './model-label.js';
 import { CloudflareRateLimitError } from './cloudflare-embedding.js';
-import {
-  INDEX_METHOD_SEMANTIC,
-  createIndexLedgerCheckpoint,
-  indexLedgerKey,
-} from './index-ledger.js';
+import { INDEX_METHOD_SEMANTIC } from './index-ledger.js';
 import {
   deleteIndexProfile,
   ensureIndexProfile,
@@ -731,16 +727,12 @@ const streamThreadRowsToIndex = async (
 ): Promise<number> => {
   await ensureCollectionIndexProfile(collection, { createIfMissing: true });
   const limits = await getEmbeddingLimits();
-  let totalChunks = 0;
-  for (const chunk of iterateThreadChunks(rows, limits.maxInputTokens, limits.countTokens)) {
-    if (!chunkFilter(chunk)) continue;
-    totalChunks++;
-  }
+  const maxInputTokens = Math.min(limits.maxInputTokens, EMBED_BATCH_TOKEN_BUDGET);
   let totalTokens = 0;
   let chunksWritten: number;
-  await options.onEmbeddingProgress?.(0, totalChunks, 0);
+  await options.onEmbeddingProgress?.(0, undefined, 0);
   const source = (function* () {
-    for (const chunk of iterateThreadChunks(rows, limits.maxInputTokens, limits.countTokens)) {
+    for (const chunk of iterateThreadChunks(rows, maxInputTokens, limits.countTokens)) {
       if (chunkFilter(chunk)) yield chunk;
     }
   })();
@@ -749,7 +741,7 @@ const streamThreadRowsToIndex = async (
     signal: options.signal,
     maxBatchSize: EMBED_BATCH_SIZE,
     paddedTokenBudget: EMBED_BATCH_TOKEN_BUDGET,
-    maxInputTokens: limits.maxInputTokens,
+    maxInputTokens,
     countTokens: limits.countTokens,
     embedBatch: async (batch) => {
       const vectors = await embed(batch.map((chunk) => chunk.text));
@@ -758,8 +750,8 @@ const streamThreadRowsToIndex = async (
     writeBatch: (batch) => upsertEmbeddedRows(collection, batch),
     onBatchCommitted: async (done, batch) => {
       chunksWritten = done;
-      totalTokens += batch.reduce((sum, chunk) => sum + Math.ceil(chunk.text.length / 4), 0);
-      await options.onEmbeddingProgress?.(done, totalChunks, totalTokens);
+      totalTokens += batch.reduce((sum, chunk) => sum + limits.countTokens(chunk.text), 0);
+      await options.onEmbeddingProgress?.(done, undefined, totalTokens);
     },
   });
   return chunksWritten;
@@ -900,10 +892,29 @@ export const replaceImportedFiles = async (
       await deleteEmbeddedRows(collection, chunkScope);
       // Once archive publication succeeds, finish the index commit even if the
       // importing client disconnects. The durable marker still protects search.
-      const chunkCount = await streamThreadRowsToIndex(collection, next, {
-        ...options,
-        signal: undefined,
-      });
+      let chunkCount: number;
+      try {
+        chunkCount = await streamThreadRowsToIndex(collection, next, {
+          ...options,
+          signal: undefined,
+        });
+      } catch (error) {
+        if (error instanceof CloudflareRateLimitError) {
+          await withCollectionWriteLock(THREADS_TABLE, async () => {
+            const tbl = await openTable(THREADS_TABLE);
+            await tbl?.update({
+              where: `(${scope}) AND indexPending NOT IN ('', 'invalid')`,
+              values: {
+                indexAttempts: 0,
+                indexRetryAt: error.retryAt,
+                indexError: error.message.slice(0, 500),
+                ...activeIndexLedgerFields(),
+              },
+            });
+          });
+        }
+        throw error;
+      }
 
       const acknowledged = await withCollectionWriteLock(THREADS_TABLE, async () => {
         if (
@@ -989,12 +1000,17 @@ export const indexStoredFile = async (
           ? 'true'
           : `sourceFile = '${escapeSqlString(sourceFile)}'${full ? '' : ' AND createdInThreadShelf = true'}`;
         await deleteEmbeddedRows(collection, vectorScope);
-        const chunkCount = await streamThreadRowsToIndex(
-          collection,
-          rows,
-          options,
-          (chunk) => full || Boolean(chunk.createdInThreadShelf),
+        const indexableRows = rows.filter(
+          (row) => row.indexPending !== 'delete' && row.indexPending !== 'reset',
         );
+        const chunkCount = indexableRows.length
+          ? await streamThreadRowsToIndex(
+              collection,
+              indexableRows,
+              options,
+              (chunk) => full || Boolean(chunk.createdInThreadShelf),
+            )
+          : 0;
         const committed = await withCollectionWriteLock(THREADS_TABLE, async () => {
           const current = await indexScope(collection, sourceFile);
           if (
@@ -1086,18 +1102,10 @@ export const recoverPendingIndexes = (
         row.collection !== options.collection
       )
         continue;
-      const identity = {
-        collection: String(row.collection),
-        model: String(row.indexModel || getEmbeddingModelIdentity()),
-        method: String(row.indexMethod || INDEX_METHOD_SEMANTIC),
-      };
       const scope = resets.has(row.collection) ? '*' : String(row.sourceFile);
-      const checkpoint = createIndexLedgerCheckpoint(identity, scope, {
-        attempts: Number(row.indexAttempts) || 0,
-        retryAt: Number(row.indexRetryAt) || 0,
-        error: String(row.indexError || ''),
-      });
-      const key = indexLedgerKey(checkpoint, scope);
+      // A reset is one physical collection rebuild even when tombstones and
+      // replacement rows carry model identities from different generations.
+      const key = JSON.stringify([String(row.collection), scope]);
       jobs.set(key, [...(jobs.get(key) ?? []), row]);
     }
     for (const job of jobs.values()) {
@@ -1149,7 +1157,10 @@ export interface SearchResult {
 // A pending full replacement may have different turn offsets from its old
 // vectors. Hide those files until recovery publishes their matching index.
 const readyIndexCache = new Map<string, { version: number; filter: string }>();
-const readyIndexFilter = async (collection: string): Promise<string> => {
+const readyIndexFilter = async (
+  collection: string,
+  vectorColumns: ReadonlySet<string>,
+): Promise<string> => {
   const tbl = await openTable(THREADS_TABLE);
   if (!tbl) return '';
   await ensureThreadsSchema(tbl);
@@ -1167,7 +1178,9 @@ const readyIndexFilter = async (collection: string): Promise<string> => {
   const excluded = rows.map((row) =>
     row.indexPending === 'invalid'
       ? `(sourceFile = '${escapeSqlString(String(row.sourceFile))}' AND conversationKey = '${escapeSqlString(String(row.conversationKey))}')`
-      : `sourceFile = '${escapeSqlString(String(row.sourceFile))}'`,
+      : row.indexPending === 'local' && vectorColumns.has('createdInThreadShelf')
+        ? `(sourceFile = '${escapeSqlString(String(row.sourceFile))}' AND createdInThreadShelf = true)`
+        : `sourceFile = '${escapeSqlString(String(row.sourceFile))}'`,
   );
   const filter = rows.some((row) => row.indexPending === 'reset')
     ? 'false'
@@ -1284,7 +1297,7 @@ const buildChunkFilter = async (
     (!opts.origin || columns.has('createdInThreadShelf'));
   const clauses = [
     ...extra,
-    await readyIndexFilter(collection),
+    await readyIndexFilter(collection, columns),
     opts.roles?.length
       ? `role IN (${opts.roles.map((role) => `'${escapeSqlString(role)}'`).join(', ')})`
       : '',

@@ -207,12 +207,14 @@ stored thread -> generation registry -> llama.cpp (local) OR Strata (local, exte
   the bound without hardcoding a model's window. Inference and LanceDB writes run
   in the same Node stream pipeline; bounded object-mode queues allow overlap and
   apply ordinary backpressure only when the sink falls behind. A failed or
-  interrupted rebuild can leave partial vectors physically stored, but the
-  pending marker keeps that scope out of search until recovery completes.
+  interrupted rebuild can leave partial vectors physically stored. A `local`
+  pending marker hides only generated local vectors so imported vectors remain
+  searchable; `all` hides the whole source file and `reset` hides the collection
+  until recovery completes.
   `__threads.indexPending` is the LanceDB persistence adapter for durable index
   jobs, committed with the turns (`local`, `all`, `delete`, or collection-wide
   `reset`; empty means indexed; `invalid` marks an undecodable row whose raw data
-  is retained). The HTTP server, MCP server and `ingest`/`search`
+  is retained and is not a retryable recovery job). The HTTP server, MCP server and `ingest`/`search`
   CLIs all run recovery against current stored turns; failures persist
   `indexAttempts`/`indexRetryAt`/`indexError` with 15 s–1 h backoff and pause
   after 8 ordinary failures until the thread changes. Cloudflare 429 responses
@@ -237,10 +239,12 @@ stored thread -> generation registry -> llama.cpp (local) OR Strata (local, exte
 - Reimport preserves ThreadShelf-authored continuations, including branches whose
   conversation keys disappear. A rewritten positional key preserves the old
   branch separately. Exports that parse to zero conversations are skipped and
-  never delete archived rows. `clearFirst` stages the entire folder and its
-  embeddings before committing; invalid, empty or failed files and pre-commit
-  cancellation leave the old collection intact and return
-  `replacementSkipped: true`. This staging uses memory proportional to the folder.
+  never delete archived rows. `clearFirst` stages the source files, publishes
+  the replacement archive with a durable reset marker, then streams vectors.
+  If embedding fails after archive publication, search hides the collection
+  until recovery finishes; the old archive is not restored. Invalid, empty, or
+  failed source files detected before publication leave the old collection
+  intact and return `replacementSkipped: true`.
 - Supported providers live in `src/parser.ts` (`detectProvider`): `google-ai-studio`,
   `anthropic`, `openai`, `openrouter`, `lm-studio`, `grok`. Adding a provider = add a detector + a
   `build…Conversations` function + a fixture + tests.

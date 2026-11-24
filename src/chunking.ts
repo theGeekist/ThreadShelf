@@ -103,7 +103,7 @@ export const splitTextByTokenBudget = (
       best = next;
     }
 
-    const end = preferredBoundary(text, start, best);
+    const end = best >= text.length ? text.length : preferredBoundary(text, start, best);
     const part = text.slice(start, end).trim();
     if (part) parts.push(part);
     if (end >= text.length) break;

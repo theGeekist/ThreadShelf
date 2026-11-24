@@ -33,9 +33,10 @@ export const streamEmbeddingsToStore = async <Chunk extends { readonly text: str
 ): Promise<number> => {
   const maxBatchSize = Math.floor(options.maxBatchSize);
   const maxInputTokens = Math.floor(options.maxInputTokens);
-  const paddedTokenBudget = Math.max(maxInputTokens, Math.floor(options.paddedTokenBudget));
+  const paddedTokenBudget = Math.floor(options.paddedTokenBudget);
   if (maxBatchSize < 1) throw new RangeError('maxBatchSize must be positive');
   if (maxInputTokens < 1) throw new RangeError('maxInputTokens must be positive');
+  if (paddedTokenBudget < 1) throw new RangeError('paddedTokenBudget must be positive');
 
   let chunksWritten = 0;
   const source = Readable.from(options.source, { objectMode: true, highWaterMark: 1 });

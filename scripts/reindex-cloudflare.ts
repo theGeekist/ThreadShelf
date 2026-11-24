@@ -10,8 +10,10 @@ import { finished } from 'node:stream/promises';
 import { dataPath } from '../src/paths.js';
 import {
   CloudflareRateLimitError,
+  countCloudflareInputTokens,
   embedWithCloudflare,
   getCloudflareEmbeddingProfile,
+  getCloudflareMaxInputTokens,
 } from '../src/cloudflare-embedding.js';
 import { getEmbeddingModelIdentity } from '../src/embedding.js';
 import { writeIndexProfile } from '../src/index-profile.js';
@@ -321,9 +323,9 @@ const assertArchiveReady = async (sourceDb: Connection): Promise<void> => {
   const threads = await sourceDb.openTable('__threads');
   for await (const recordBatch of threads.query().select(['sourceFile', 'indexPending'])) {
     for (const row of recordBatch.toArray() as Record<string, unknown>[]) {
-      if (String(row.indexPending || '')) {
+      if (String(row.indexPending || '') && String(row.indexPending) !== 'invalid') {
         throw new Error(
-          `Cannot reindex while thread ${String(row.sourceFile)} has a pending index job. Finish recovery first.`,
+          `Cannot reindex while thread ${String(row.sourceFile)} has active ${String(row.indexPending)} indexing work. Finish recovery first.`,
         );
       }
     }
@@ -394,6 +396,22 @@ const streamTable = async (
     if (batchKeys.length === 0) return;
     let rows = await fetchRowsForKeys(sourceTable, batchKeys, mode, tableName);
     if (mode === 'vectors') {
+      const invalid = rows.find(
+        (row) => typeof row.document !== 'string' || row.document.length === 0,
+      );
+      if (invalid) {
+        throw new Error(`Table ${tableName} has a chunk without document text; cannot re-embed it`);
+      }
+      const maxInputTokens = getCloudflareMaxInputTokens();
+      const oversized = rows.find(
+        (row) => countCloudflareInputTokens(String(row.document)) > maxInputTokens,
+      );
+      if (oversized) {
+        const count = countCloudflareInputTokens(String(oversized.document));
+        throw new Error(
+          `Stored chunk ${String(oversized.id)} has ${count} target tokens; the configured embedding limit is ${maxInputTokens}. Increase THREADSHELF_EMBEDDING_MAX_INPUT_TOKENS or re-chunk the archive before reindexing.`,
+        );
+      }
       const vectors = await embedBatch(
         rows.map((row) => String(row.document)),
         async (retryAt, error) => {

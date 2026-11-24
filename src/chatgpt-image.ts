@@ -48,13 +48,7 @@ export const readChatGptImage = async (
       zip.on('error', reject);
       zip.on('entry', (item: yauzl.Entry) => {
         const name = item.fileName;
-        if (
-          !name.includes('/') &&
-          !name.includes('\\') &&
-          (name === `${assetId}.dat` ||
-            ((name.startsWith(`${assetId}-`) || name.startsWith(`${assetId}_`)) &&
-              name.endsWith('.dat')))
-        )
+        if (!name.includes('/') && !name.includes('\\') && name === `${assetId}.dat`)
           matches.push(item);
         zip.readEntry();
       });

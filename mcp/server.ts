@@ -405,7 +405,9 @@ const toolReadThread = async (args: Record<string, unknown> = {}): Promise<unkno
     }
     conversationKey = args.conversationKey || undefined;
   }
-  const thread = await loadThread(sourceFile, collection, conversationKey);
+  const thread = await loadThread(sourceFile, collection, conversationKey, {
+    maxSourceBytes: 64 * 1024 * 1024,
+  });
   return { ...thread, ...chatgptSource(thread.conversationKey) };
 };
 

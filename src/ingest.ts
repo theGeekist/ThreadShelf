@@ -145,14 +145,13 @@ export const ingestFolder = async (
   return ingestFilesInternal(collection, files, opts, opts.clearFirst === true);
 };
 
-// Ingest an explicit list of export files (watch mode re-indexes just the
-// files that changed). `clearFirst` is intentionally ignored here — clearing
-// belongs to whole-folder ingests.
+// Ingest an explicit list of export files (uploads and watch mode use this so
+// unrelated files already present in a directory are not re-imported).
 export const ingestFiles = async (
   collection: string,
   files: readonly string[],
   opts: IngestOptions = {},
-): Promise<IngestResult> => ingestFilesInternal(collection, files, opts, false);
+): Promise<IngestResult> => ingestFilesInternal(collection, files, opts, opts.clearFirst === true);
 
 const ingestFilesInternal = async (
   collection: string,
