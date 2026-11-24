@@ -45,4 +45,3 @@ export const createIndexLedgerCheckpoint = (
   error: progress.error ?? '',
   updatedAt: new Date().toISOString(),
 });
-
