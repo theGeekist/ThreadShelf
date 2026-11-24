@@ -2,13 +2,12 @@
 
 ## Is my data sent to a cloud service?
 
-No for the core search flow. Exports are parsed locally, embeddings are generated locally, and vectors are stored locally in LanceDB.
+The archive and LanceDB stay on your device, but **the default embedding provider sends chunk text and semantic search queries to Cloudflare Workers AI**. Set `THREADSHELF_EMBEDDING_PROVIDER=local` to generate embeddings on-device with MiniLM. Keyword search is local either way.
 
-The first embedding model load may download model files through the Transformers/Xenova stack if they are not already cached. After that, search/indexing uses the local model cache.
+Cloudflare mode requires an account ID and API token. Local mode may download model files through the Transformers/Xenova stack on first use; after that, indexing and search use the local model cache.
 
-The optional OpenRouter generation provider is the explicit exception: selecting
-**OpenRouter · external** sends the selected user/assistant context and new prompt
-off-device. Local `llama.cpp` generation remains on loopback.
+Selecting **OpenRouter · external** sends the selected user/assistant context
+and new prompt off-device. Local `llama.cpp` generation remains on loopback.
 
 ## What problem is this trying to solve?
 

@@ -71,10 +71,11 @@ The response limit defaults to 4,096 tokens. Its numeric field suggests common
 presets while accepting custom whole values up to the smaller of the known model
 context window and the API safety cap of 32,768 tokens.
 
-Completed ThreadShelf questions, reasoning, and answers are embedded locally.
-Only ThreadShelf-authored chunks are replaced during a retry, so imported chunks
-are not re-embedded. Imported-thread continuations remain in their original
-collection. Per-turn `createdInThreadShelf`, backend, model, and timestamp fields
+Completed ThreadShelf questions, reasoning, and answers are embedded with the
+configured provider (Cloudflare by default, or local MiniLM). Only ThreadShelf-
+authored chunks are replaced during a retry, so imported chunks are not
+re-embedded. Imported-thread continuations remain in their original collection.
+Per-turn `createdInThreadShelf`, backend, model, and timestamp fields
 drive the restrained emerald provenance marker and the **All / ThreadShelf /
 Clean archive** origin filter. Only mixed imported threads show the ThreadShelf
 checkbox; created chats do not repeat their origin or model on every message.

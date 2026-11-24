@@ -6,15 +6,19 @@ project. `CLAUDE.md` simply points here so Claude Code picks up the same rules.
 
 ## What this project is
 
-**ThreadShelf** — a local, offline semantic-search and backup tool for AI chat
+**ThreadShelf** — a local archive and semantic-search tool for AI chat
 exports (Google AI Studio, OpenRouter, OpenAI/ChatGPT, Anthropic/Claude, LM Studio,
 Grok/xAI). It
-parses exported JSON into normalized turns, chunks and embeds them locally
-(Xenova/Transformers.js), stores vectors in LanceDB, and exposes search through a
-React web UI, an HTTP API, and an MCP stdio server.
+parses exported JSON into normalized turns, chunks and embeds them with Cloudflare
+Workers AI by default (or local Xenova/Transformers.js when configured), stores
+vectors in LanceDB, and exposes search through a React web UI, an HTTP API, and
+an MCP stdio server.
 
-Parsing, embeddings, storage, and search run on the user's machine. **By default,
-no chat data leaves the device.** The embedding model may be downloaded on first use.
+Parsing, storage, and search run on the user's machine. Cloudflare Workers AI
+BGE-M3 embeddings are the default and send chunk text and semantic queries
+off-device. Set `THREADSHELF_EMBEDDING_PROVIDER=local` to use local MiniLM instead.
+The two providers require separate LanceDB databases because their vectors have
+different dimensions. Never mix vectors from the two embedding spaces.
 Treat all real chat exports as private.
 
 The optional conversation-generation layer's primary `llama.cpp` engine is
@@ -48,7 +52,8 @@ src/                Server + core logic (TypeScript, ESM, run via tsx)
   cli.ts            `npm run parse` CLI
   parser.ts         Provider detection + export -> normalized turns
   chunking.ts       Turn -> embeddable chunks
-  embedding.ts      Local Xenova embeddings
+  embedding.ts      Cloudflare or local Xenova embeddings
+  index-ledger.ts  Shared identity and checkpoint contract for indexing jobs
   model-label.ts    Portable model labels (strip private local filesystem prefixes)
   ingest.ts         Parse -> chunk -> embed -> store pipeline
   watch.ts          Watch-folder mode (fs.watch + debounced re-ingest)
@@ -59,6 +64,7 @@ src/                Server + core logic (TypeScript, ESM, run via tsx)
     local-origin.ts        Host/Origin guards: `/api` + loopback `/v1`, and the network listener
     stream-abort.ts        Shared "client went away" AbortController for streamed routes
   services/         search, thread, collections, insights business logic
+    ingest-jobs.ts      Persistent saved folder-indexing jobs with stop/resume
   obsidian/         Local vault config, safe Markdown operations, scoped tools and browser deletion approvals
   generation/       Generation provider plugins, config, model discovery, llama wrapper
     downloader.ts          Shared resumable, hash-verifying downloader (runtime + models)
@@ -113,7 +119,9 @@ root installs both.
 | `npm run parse -- <file> -- [flags]`                 | Parse one export to normalized JSON; the second `--` is required before flags.          |
 | `npm run ingest -- <folder> [collection] -- [flags]` | Ingest a folder (`--clear`; `--watch`; `--debounce`).                                   |
 | `npm run search -- "<query>" -- [flags]`             | Search from the CLI (`--mode keyword`, `--collection`, `--n`, `--json`).                |
-| `npm run bench:search -- --check`                     | Run the isolated synthetic search-quality benchmark against its baseline.             |
+| `npm run reindex:cloudflare -- [flags]`              | Stream current LanceDB chunk text into a separate BGE-M3 index.                         |
+| `npm run bench:ingest-stream`                        | Compare synthetic whole-array and bounded streaming ingest memory and time.             |
+| `npm run bench:search -- --check`                    | Run the isolated synthetic search-quality benchmark against its baseline.               |
 | `npm run setup:llama`                                | Local discovery only; `-- -- --check` reads metadata; install needs explicit consent.   |
 | `npm run build:package`                              | Build the publishable package: client UI into `public/`, server + MCP into `dist/`.     |
 | `npm pack --dry-run`                                 | Inspect exactly what would be published (runs `prepack`).                               |
@@ -156,14 +164,14 @@ touched the parser/ingest/search, `npm test && npm run test:e2e` is the minimum.
   always win. Serve package files with `res.sendFile(name, { root })`: the package may
   live under a dot directory (`~/.npm/_npx`), which `send` otherwise refuses. `test/packaging.test.js` fails the build if `process.cwd()`
   reappears in `src/` or `mcp/`.
-- **No new runtime dependencies** without a clear reason — a goal of the project
-  is to stay light and fully local. Never add anything that phones home.
+- **No new runtime dependencies** without a clear reason — keep the application
+  light. Never add an external service or data transfer without documenting it.
 
 ## Data model (mental model)
 
 ```
 JSON export -> parser (detectProvider) -> normalized Turn[]
-            -> chunking -> local embeddings -> LanceDB collection
+            -> chunking -> Cloudflare embeddings by default (or local MiniLM) -> LanceDB collection
             -> UI / HTTP API / MCP search
 
 stored thread -> generation registry -> llama.cpp (local) OR Strata (local, external process) OR OpenRouter (external, explicit consent)
@@ -190,17 +198,34 @@ stored thread -> generation registry -> llama.cpp (local) OR Strata (local, exte
   `createdInThreadShelf: true`. It has no fake export file. Completed exchanges
   and imported-thread continuations are persisted by `src/generation/threads.ts`
   and only their ThreadShelf-authored chunks are refreshed in semantic search.
-- Archive replacements use a single LanceDB merge commit. `__threads.indexPending`
-  is a durable index job, committed with the turns (`local`, `all`, `delete`, or
-  collection-wide `reset`; empty means indexed; `invalid` marks an undecodable
-  row whose raw data is retained). The HTTP server, MCP server and `ingest`/`search`
+- Archive replacements first commit turns with pending state from the shared
+  `src/index-ledger.ts` contract, then
+  stream tokenizer-bounded chunks through bounded embedding batches into LanceDB.
+  `EMBED_BATCH_SIZE` caps chunk count (default 25); `EMBED_BATCH_TOKEN_BUDGET`
+  caps padded model input slots (default 2048). The active model tokenizer and
+  context limit determine chunk splitting, so changing embedding models changes
+  the bound without hardcoding a model's window. Inference and LanceDB writes run
+  in the same Node stream pipeline; bounded object-mode queues allow overlap and
+  apply ordinary backpressure only when the sink falls behind. A failed or
+  interrupted rebuild can leave partial vectors physically stored. A `local`
+  pending marker hides only generated local vectors so imported vectors remain
+  searchable; `all` hides the whole source file and `reset` hides the collection
+  until recovery completes.
+  `__threads.indexPending` is the LanceDB persistence adapter for durable index
+  jobs, committed with the turns (`local`, `all`, `delete`, or collection-wide
+  `reset`; empty means indexed; `invalid` marks an undecodable row whose raw data
+  is retained and is not a retryable recovery job). The HTTP server, MCP server and `ingest`/`search`
   CLIs all run recovery against current stored turns; failures persist
   `indexAttempts`/`indexRetryAt`/`indexError` with 15 s–1 h backoff and pause
-  after 8 attempts until the thread changes. Deletion tombstones and reset
+  after 8 ordinary failures until the thread changes. Cloudflare 429 responses
+  persist their `Retry-After` time (or the next UTC midnight for daily quota
+  exhaustion) and reset the ordinary-failure counter. The recovery scheduler
+  checks due jobs every 15 seconds and resumes them after restart. Deletion tombstones and reset
   markers are hidden from thread lists; pending full replacements are hidden from
   search until their matching vectors are published. Embedding never runs under
-  the global `__threads` lock: read a snapshot, embed, then re-check the snapshot
-  before committing (retry on change). Keep collection then thread-table lock
+  the global `__threads` lock: publish the pending snapshot, stream and commit
+  vector batches, then re-check the archive before acknowledging (retry on
+  change). Keep collection then thread-table lock
   ordering; never queue saved turn snapshots for a later retry. LanceDB is opened
   with `readConsistencyInterval: 0` so processes see each other's commits.
 - Rename updates only the title column; appends build turns from the current row
@@ -214,10 +239,12 @@ stored thread -> generation registry -> llama.cpp (local) OR Strata (local, exte
 - Reimport preserves ThreadShelf-authored continuations, including branches whose
   conversation keys disappear. A rewritten positional key preserves the old
   branch separately. Exports that parse to zero conversations are skipped and
-  never delete archived rows. `clearFirst` stages the entire folder and its
-  embeddings before committing; invalid, empty or failed files and pre-commit
-  cancellation leave the old collection intact and return
-  `replacementSkipped: true`. This staging uses memory proportional to the folder.
+  never delete archived rows. `clearFirst` stages the source files, publishes
+  the replacement archive with a durable reset marker, then streams vectors.
+  If embedding fails after archive publication, search hides the collection
+  until recovery finishes; the old archive is not restored. Invalid, empty, or
+  failed source files detected before publication leave the old collection
+  intact and return `replacementSkipped: true`.
 - Supported providers live in `src/parser.ts` (`detectProvider`): `google-ai-studio`,
   `anthropic`, `openai`, `openrouter`, `lm-studio`, `grok`. Adding a provider = add a detector + a
   `build…Conversations` function + a fixture + tests.
@@ -320,16 +347,19 @@ operations. All server test helpers must set `OBSIDIAN_CONFIG_PATH` to isolated
 temp storage; tests must never connect to the developer's real vault. See
 `docs/OBSIDIAN.md` for bounds and limitations.
 
-Three, all opt-in and none of them carrying chat content:
+The following external network surfaces exist:
 
-1. **OpenRouter** — the only surface that sends conversation text off-device.
-2. **GitHub Releases** (`ggml-org/llama.cpp`) — release metadata; archives only
+1. **OpenRouter** — sends selected conversation text to the chosen model.
+2. **Cloudflare Workers AI** — the default embedding provider sends chunk text
+   and search queries to `@cf/baai/bge-m3`. Set the local provider to keep
+   embeddings on-device. Requests use Cloudflare's OpenAI-compatible endpoint.
+3. **GitHub Releases** (`ggml-org/llama.cpp`) — release metadata; archives only
    after explicit `--install`/`--url` consent or the setup screen's confirmation.
    Upstream's `/releases/latest` points at a semver release with no binaries, so
    `resolveLlamaRelease` follows the `nightly-tag.txt` pointer to the real
    `bNNNNN` build. `GITHUB_TOKEN` raises the anonymous rate limit.
-3. **Hugging Face Hub** — catalog metadata and GGUF downloads. The public API
-   needs no token; `HF_TOKEN` is only required for *gated* repositories, which
+4. **Hugging Face Hub** — catalog metadata and GGUF downloads. The public API
+   needs no token; `HF_TOKEN` is only required for _gated_ repositories, which
    are detected up front and marked in the UI. Every file is verified against the
    LFS `oid` (its SHA-256) before it is moved into place.
 
@@ -381,6 +411,9 @@ starts it with no clone and no build.
 
 When you finish a task, update this file if you changed commands, layout, or
 conventions.
+
+Cloudflare embeddings setup and the separate-index migration command are
+documented in `docs/CLOUDFLARE_EMBEDDINGS.md`.
 
 ## Vision runtime
 

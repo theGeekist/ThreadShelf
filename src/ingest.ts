@@ -145,14 +145,13 @@ export const ingestFolder = async (
   return ingestFilesInternal(collection, files, opts, opts.clearFirst === true);
 };
 
-// Ingest an explicit list of export files (watch mode re-indexes just the
-// files that changed). `clearFirst` is intentionally ignored here — clearing
-// belongs to whole-folder ingests.
+// Ingest an explicit list of export files (uploads and watch mode use this so
+// unrelated files already present in a directory are not re-imported).
 export const ingestFiles = async (
   collection: string,
   files: readonly string[],
   opts: IngestOptions = {},
-): Promise<IngestResult> => ingestFilesInternal(collection, files, opts, false);
+): Promise<IngestResult> => ingestFilesInternal(collection, files, opts, opts.clearFirst === true);
 
 const ingestFilesInternal = async (
   collection: string,
@@ -253,6 +252,7 @@ const ingestFilesInternal = async (
           signal: opts.signal,
           onEmbeddingProgress: (done, total, tokens) => {
             totalTokens = previousTokens + tokens;
+            const chunkProgress = total === undefined ? undefined : done / Math.max(total, 1);
             onProgress({
               status: 'progress',
               phase: 'embedding',
@@ -265,7 +265,9 @@ const ingestFilesInternal = async (
               embeddingDone: done,
               embeddingTotal: total,
               progressPercent:
-                (95 * (processedFiles + done / Math.max(total, 1))) / Math.max(totalFiles, 1),
+                chunkProgress === undefined
+                  ? undefined
+                  : (95 * (processedFiles + chunkProgress)) / Math.max(totalFiles, 1),
             });
           },
         });
@@ -301,6 +303,7 @@ const ingestFilesInternal = async (
         signal: opts.signal,
         onEmbeddingProgress: (done, total, tokens) => {
           totalTokens = tokens;
+          const chunkProgress = total === undefined ? undefined : done / Math.max(total, 1);
           onProgress({
             status: 'progress',
             phase: 'embedding',
@@ -311,7 +314,7 @@ const ingestFilesInternal = async (
             elapsedMs: Date.now() - startTime,
             embeddingDone: done,
             embeddingTotal: total,
-            progressPercent: 20 + (75 * done) / Math.max(total, 1),
+            progressPercent: chunkProgress === undefined ? undefined : 20 + 75 * chunkProgress,
           });
         },
       });

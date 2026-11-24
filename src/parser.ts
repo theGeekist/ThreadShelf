@@ -645,7 +645,7 @@ const getOpenAINodeCreateTime = (node: AnyObj): number => {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 };
 
-const getOpenAIConversationPath = (conversation: AnyObj): AnyObj[] => {
+export const getOpenAIConversationPath = (conversation: AnyObj): AnyObj[] => {
   const mapping = conversation?.mapping;
   if (!mapping || typeof mapping !== 'object') return [];
 

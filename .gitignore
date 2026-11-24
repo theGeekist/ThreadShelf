@@ -82,3 +82,8 @@ data/
 # Local agent notes (board Q&A, second-AI review log)
 QA.md
 REVIEWS.md
+
+# Local shared documents stay ignored; this source guide is intentionally tracked.
+!/docs/
+/docs/*
+!/docs/CLOUDFLARE_EMBEDDINGS.md

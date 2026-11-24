@@ -14,12 +14,13 @@ process.env.LANCEDB_PATH = join(root, '.lancedb');
 const { searchCollection, keywordSearchCollection } = await import('../src/store.ts');
 
 const ROWS = 600;
-const QUERY = [1, 0];
+const DIMENSION = 384;
+const QUERY = [1, ...Array(DIMENSION - 1).fill(0)];
 // Row i sits at angle i/ROWS * 3 rad from the query, so its cosine distance
 // grows with i and the last row is the farthest one.
 const vectorAt = (i) => {
   const angle = (i / ROWS) * 3;
-  return [Math.cos(angle), Math.sin(angle)];
+  return [Math.cos(angle), Math.sin(angle), ...Array(DIMENSION - 2).fill(0)];
 };
 
 const chunk = (i, overrides = {}) => ({
@@ -166,6 +167,36 @@ describe('semantic search filters cover the whole collection', () => {
     const rows = await searchCollection('legacy_no_model', 'q', { n: 2 }, QUERY);
     assert.deepStrictEqual(ids(rows), ['legacy-0', 'legacy-1']);
   });
+});
+
+test('local-only pending rebuild hides generated rows while keeping imported vectors searchable', async () => {
+  await db.createTable('__threads', [
+    {
+      collection: 'pending_local',
+      sourceFile: 'pending.json',
+      conversationKey: 'pending-chat',
+      indexPending: 'local',
+    },
+  ]);
+  await db.createTable('pending_local', [
+    {
+      ...chunk(0),
+      id: 'imported-row',
+      sourceFile: 'pending.json',
+      document: 'Imported archived content remains available',
+      createdInThreadShelf: false,
+    },
+    {
+      ...chunk(1),
+      id: 'generated-row',
+      sourceFile: 'pending.json',
+      document: 'Partially rebuilt local generated content',
+      createdInThreadShelf: true,
+    },
+  ]);
+
+  const rows = await searchCollection('pending_local', 'query', { n: 5 }, QUERY);
+  assert.deepEqual(ids(rows), ['imported-row']);
 });
 
 describe('keyword search ranks every match', () => {

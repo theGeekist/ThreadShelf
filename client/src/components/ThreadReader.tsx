@@ -321,6 +321,9 @@ export function ThreadReader({
         <div id="threadContent" className="thread-inner" ref={innerRef}>
           <div className="thread-hero">
             <h1>{title}</h1>
+            {/^openai:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(conversationKey ?? '') && (
+              <a href={`https://chatgpt.com/c/${conversationKey!.slice(7)}`} target="_blank" rel="noreferrer">Open original in ChatGPT ↗</a>
+            )}
             <div className="meta-row">
               {detectedModel && (
                 <>

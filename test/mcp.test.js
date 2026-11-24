@@ -12,14 +12,18 @@ describe('MCP — protocol surface', () => {
   it('declares archive tools and the four safe vault tools', () => {
     const names = TOOL_DEFINITIONS.map((tool) => tool.name).sort();
     assert.deepStrictEqual(names, [
+      'export_thread_markdown',
       'get_stats',
+      'import_queue_status',
       'list_collections',
       'list_files',
+      'list_thread_attachments',
       'obsidian_create',
       'obsidian_edit',
       'obsidian_read',
       'obsidian_search',
       'read_thread',
+      'read_thread_image',
       'search',
     ]);
   });

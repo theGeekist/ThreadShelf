@@ -5,8 +5,14 @@ import { existsSync, mkdirSync } from 'fs';
 import { copyFile, mkdir, rm } from 'fs/promises';
 import { randomUUID } from 'crypto';
 import { dataPath } from '../paths.js';
-import { ingestFolder, listExportFiles } from '../ingest.js';
+import { ingestFiles, ingestFolder, listExportFiles } from '../ingest.js';
 import { listSourceFilesInCollection } from '../store.js';
+import {
+  continueIngestJob,
+  createIngestJob,
+  getIngestJob,
+  stopIngestJob,
+} from '../services/ingest-jobs.js';
 import {
   ValidationError,
   normalizeCollectionName,
@@ -109,8 +115,9 @@ const persistUploadedFiles = async (
   files: readonly Express.Multer.File[],
   targetDir: string,
   onFile?: (processedFiles: number, relativePath: string) => void,
-): Promise<{ ok: true } | { ok: false; error: string }> => {
+): Promise<{ ok: true; paths: string[] } | { ok: false; error: string }> => {
   await ensureUploadTarget(targetDir);
+  const paths: string[] = [];
 
   for (const [index, file] of files.entries()) {
     const { rel, relativePath } = uploadRelativePath(file.fieldname);
@@ -126,10 +133,11 @@ const persistUploadedFiles = async (
     const outDir = dirname(outPath);
     if (!existsSync(outDir)) await mkdir(outDir, { recursive: true });
     await copyFile(file.path, outPath);
+    paths.push(outPath);
     onFile?.(index + 1, relativePath);
   }
 
-  return { ok: true };
+  return { ok: true, paths };
 };
 
 const writeEvent = (res: import('express').Response, payload: unknown): void => {
@@ -208,7 +216,7 @@ router.post('/api/ingest-upload', upload.any(), async (req, res) => {
       return res.status(400).json({ status: 'error', error: persisted.error });
     }
 
-    const result = await ingestFolder(collectionName, targetDir, { clearFirst });
+    const result = await ingestFiles(collectionName, persisted.paths, { clearFirst });
     res.json({ status: 'completed', result, collectionName });
   } catch (e) {
     console.error('[/api/ingest-upload]', e);
@@ -277,7 +285,7 @@ router.post('/api/ingest-upload-progress', upload.any(), async (req, res) => {
     }
 
     const onProgress = (data: unknown) => writeEvent(res, data);
-    const result = await ingestFolder(collectionName, targetDir, {
+    const result = await ingestFiles(collectionName, persisted.paths, {
       clearFirst,
       onProgress,
       signal: controller.signal,
@@ -342,6 +350,67 @@ router.post('/api/ingest-progress', async (req, res) => {
     }
   } finally {
     res.end();
+  }
+});
+
+const sendIngestJobError = (res: import('express').Response, error: unknown): void => {
+  const status = (error as { status?: unknown })?.status;
+  res
+    .status(typeof status === 'number' ? status : error instanceof ValidationError ? 400 : 500)
+    .json({
+      error: error instanceof Error ? error.message : String(error),
+    });
+};
+
+router.get('/api/ingest-jobs', async (req, res) => {
+  try {
+    const collection = normalizeCollectionSelector(req.query.collection);
+    res.json({ job: await getIngestJob(collection) });
+  } catch (error) {
+    sendIngestJobError(res, error);
+  }
+});
+
+router.post('/api/ingest-jobs', async (req, res) => {
+  const { folderPath, selectedFiles } = req.body ?? {};
+  if (
+    typeof folderPath !== 'string' ||
+    folderPath.trim().length === 0 ||
+    folderPath.length > 4096 ||
+    folderPath.includes('\0')
+  ) {
+    return res.status(400).json({ error: 'Invalid folderPath' });
+  }
+  let collection: string;
+  try {
+    collection = normalizeCollectionName(req.body?.collection);
+    if (collection === 'threadshelf_conversations') {
+      return res.status(400).json({ error: `Collection cannot be indexed: ${collection}` });
+    }
+  } catch (error) {
+    return sendIngestJobError(res, error);
+  }
+  try {
+    const job = await createIngestJob(folderPath, collection, selectedFiles);
+    res.status(202).json({ job });
+  } catch (error) {
+    sendIngestJobError(res, error);
+  }
+});
+
+router.post('/api/ingest-jobs/:id/stop', async (req, res) => {
+  try {
+    res.json({ job: await stopIngestJob(req.params.id) });
+  } catch (error) {
+    sendIngestJobError(res, error);
+  }
+});
+
+router.post('/api/ingest-jobs/:id/continue', async (req, res) => {
+  try {
+    res.json({ job: await continueIngestJob(req.params.id) });
+  } catch (error) {
+    sendIngestJobError(res, error);
   }
 });
 

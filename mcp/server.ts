@@ -1,7 +1,13 @@
 #!/usr/bin/env tsx
 import { createInterface } from 'readline';
+import { open, readFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { searchAcrossCollections } from '../src/services/search.js';
 import { loadThread } from '../src/services/thread.js';
+import { renderThreadMarkdown } from '../src/thread-markdown.js';
+import { chatGptAttachmentReferences } from '../src/chatgpt-attachments.js';
+import { readChatGptImage } from '../src/chatgpt-image.js';
 import { getAllCollections } from '../src/services/collections.js';
 import { getStatsForCollection } from '../src/services/stats.js';
 import { listSourceFilesInCollection } from '../src/store.js';
@@ -67,6 +73,12 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
     },
   },
   {
+    name: 'import_queue_status',
+    description:
+      'Read the configured local import queue status and completed file count. Total and remaining counts are available only when THREADSHELF_IMPORT_QUEUE_TOTAL is configured.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
     name: 'get_stats',
     description:
       'Return chunk, file, role, and per-collection stats for a collection or all collections.',
@@ -112,6 +124,72 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
         to: { type: 'string', description: 'Inclusive ISO date or YYYY-MM-DD upper bound.' },
       },
       required: ['query'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'read_thread_image',
+    description:
+      'Return one verified image from a configured ChatGPT export ZIP. Use list_thread_attachments first.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        assetId: { type: 'string', description: 'Image ID returned by list_thread_attachments.' },
+        sourceFile: { type: 'string', description: 'Absolute path to an indexed export file.' },
+        collection: {
+          type: 'string',
+          description:
+            'Restrict the lookup to a specific collection (or "all"). Defaults to "all".',
+        },
+        conversationKey: {
+          type: 'string',
+          description: 'Conversation key returned by search for multi-conversation export files.',
+        },
+      },
+      required: ['sourceFile', 'conversationKey', 'assetId'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'list_thread_attachments',
+    description:
+      'List original ChatGPT attachment references for one indexed conversation. Does not return files or image data.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sourceFile: { type: 'string', description: 'Absolute path to an indexed export file.' },
+        collection: {
+          type: 'string',
+          description:
+            'Restrict the lookup to a specific collection (or "all"). Defaults to "all".',
+        },
+        conversationKey: {
+          type: 'string',
+          description: 'Conversation key returned by search for multi-conversation export files.',
+        },
+      },
+      required: ['sourceFile', 'conversationKey'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'export_thread_markdown',
+    description: 'Return an archived conversation as Markdown text. Attachments are not included.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sourceFile: { type: 'string', description: 'Absolute path to an indexed export file.' },
+        collection: {
+          type: 'string',
+          description:
+            'Restrict the lookup to a specific collection (or "all"). Defaults to "all".',
+        },
+        conversationKey: {
+          type: 'string',
+          description: 'Conversation key returned by search for multi-conversation export files.',
+        },
+      },
+      required: ['sourceFile'],
       additionalProperties: false,
     },
   },
@@ -220,9 +298,61 @@ const toolListFiles = async (args: Record<string, unknown> = {}): Promise<unknow
   return { collection, files };
 };
 
+const toolImportQueueStatus = async (): Promise<unknown> => {
+  const ledger = process.env.THREADSHELF_IMPORT_QUEUE_LEDGER;
+  const unit = process.env.THREADSHELF_IMPORT_QUEUE_UNIT;
+  if (!ledger || !unit) return { configured: false };
+  const configuredTotal = process.env.THREADSHELF_IMPORT_QUEUE_TOTAL;
+  const totalFiles =
+    configuredTotal === undefined || configuredTotal.trim() === '' ? null : Number(configuredTotal);
+  if (totalFiles !== null && (!Number.isSafeInteger(totalFiles) || totalFiles < 0)) {
+    throw new Error('THREADSHELF_IMPORT_QUEUE_TOTAL must be a non-negative integer');
+  }
+  let completed: unknown = [];
+  try {
+    completed = JSON.parse(await readFile(ledger, 'utf8')) as unknown;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  if (!Array.isArray(completed) || !completed.every((file) => typeof file === 'string')) {
+    throw new Error('Invalid import queue ledger');
+  }
+  const exec = promisify(execFile);
+  const status = await exec(
+    'systemctl',
+    ['--user', 'show', unit, '-p', 'ActiveState', '-p', 'SubState', '-p', 'Result'],
+    { timeout: 5000 },
+  );
+  const logs = await exec(
+    'journalctl',
+    ['--user', '-u', unit, '-n', '200', '--no-pager', '-o', 'cat'],
+    { timeout: 5000 },
+  );
+  const latest = logs.stdout
+    .split('\n')
+    .filter((line) => line.startsWith('[remaining-import]'))
+    .slice(-3);
+  return {
+    configured: true,
+    totalFiles,
+    completedFiles: completed.length,
+    remainingFiles: totalFiles === null ? null : Math.max(0, totalFiles - completed.length),
+    nextFile: null,
+    service: status.stdout.trim(),
+    recentProgress: latest,
+  };
+};
+
 const toolGetStats = async (args: Record<string, unknown> = {}): Promise<unknown> => {
   const collection = normalizeCollectionSelector(args.collection, { defaultValue: 'all' });
   return getStatsForCollection(collection);
+};
+
+const chatgptSource = (key: string | undefined) => {
+  const match = /^openai:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(
+    key ?? '',
+  );
+  return match ? { conversationId: match[1], chatgptUrl: `https://chatgpt.com/c/${match[1]}` } : {};
 };
 
 const toolSearch = async (args: Record<string, unknown> = {}): Promise<unknown> => {
@@ -246,7 +376,13 @@ const toolSearch = async (args: Record<string, unknown> = {}): Promise<unknown> 
     to,
     mode,
   });
-  return { collection, results };
+  return {
+    collection,
+    results: results.map((result) => ({
+      ...result,
+      ...chatgptSource(result.metadata.conversationKey),
+    })),
+  };
 };
 
 const toolReadThread = async (args: Record<string, unknown> = {}): Promise<unknown> => {
@@ -269,7 +405,43 @@ const toolReadThread = async (args: Record<string, unknown> = {}): Promise<unkno
     }
     conversationKey = args.conversationKey || undefined;
   }
-  return loadThread(sourceFile, collection, conversationKey);
+  const thread = await loadThread(sourceFile, collection, conversationKey, {
+    maxSourceBytes: 64 * 1024 * 1024,
+  });
+  return { ...thread, ...chatgptSource(thread.conversationKey) };
+};
+
+/** Read only a bounded source file after the archive lookup has authorised it. */
+const toolListThreadAttachments = async (args: Record<string, unknown> = {}): Promise<unknown> => {
+  if (typeof args.conversationKey !== 'string' || !args.conversationKey.startsWith('openai:')) {
+    throw new ValidationError('A ChatGPT conversationKey is required', {
+      field: 'conversationKey',
+    });
+  }
+  const thread = (await toolReadThread(args)) as Awaited<ReturnType<typeof loadThread>>;
+  const limit = 64 * 1024 * 1024;
+  const file = await open(thread.sourceFile, 'r');
+  try {
+    const size = (await file.stat()).size;
+    if (size > limit) throw new Error('Source file exceeds the 64 MiB attachment inspection limit');
+    const buffer = Buffer.alloc(size + 1);
+    let read = 0;
+    while (read < buffer.length) {
+      const part = await file.read(buffer, read, buffer.length - read, read);
+      if (!part.bytesRead) break;
+      read += part.bytesRead;
+    }
+    if (read > limit || read !== size)
+      throw new Error('Source file changed during attachment inspection');
+    const data: unknown = JSON.parse(buffer.subarray(0, read).toString('utf8'));
+    return {
+      conversationKey: thread.conversationKey,
+      attachments: chatGptAttachmentReferences(data, thread.conversationKey),
+      filesIncluded: false,
+    };
+  } finally {
+    await file.close();
+  }
 };
 
 interface ParsedResourceUri {
@@ -358,11 +530,47 @@ const HANDLERS: Record<string, Handler> = {
         case 'list_files':
           payload = await toolListFiles(args ?? {});
           break;
+        case 'import_queue_status':
+          payload = await toolImportQueueStatus();
+          break;
         case 'get_stats':
           payload = await toolGetStats(args ?? {});
           break;
         case 'search':
           payload = await toolSearch(args ?? {});
+          break;
+        case 'read_thread_image': {
+          const assetId = args?.assetId;
+          if (typeof assetId !== 'string')
+            throw new ValidationError('Missing assetId', { field: 'assetId' });
+          const manifest = (await toolListThreadAttachments(args ?? {})) as {
+            attachments: Array<{ id: string; source: string }>;
+          };
+          if (
+            !manifest.attachments.some((item) => item.id === assetId && item.source === 'image')
+          ) {
+            throw new ValidationError('Image is not referenced by this conversation', {
+              field: 'assetId',
+            });
+          }
+          const zip = process.env.THREADSHELF_CHATGPT_EXPORT_ZIP;
+          if (!zip) throw new Error('ChatGPT export ZIP is not configured');
+          const image = await readChatGptImage(zip, assetId);
+          return {
+            content: [
+              { type: 'image', data: image.data.toString('base64'), mimeType: image.mimeType },
+            ],
+            isError: false,
+          };
+        }
+        case 'list_thread_attachments':
+          payload = await toolListThreadAttachments(args ?? {});
+          break;
+        case 'export_thread_markdown':
+          payload = renderThreadMarkdown(
+            (await toolReadThread(args ?? {})) as Awaited<ReturnType<typeof loadThread>>,
+            normalizeCollectionSelector(args?.collection, { defaultValue: 'all' }),
+          );
           break;
         case 'read_thread':
           payload = await toolReadThread(args ?? {});
@@ -463,6 +671,7 @@ export const __testing__ = {
   RESOURCE_TEMPLATES,
   parseResourceUri,
   toolListFiles,
+  toolImportQueueStatus,
   toolGetStats,
   toolSearch,
   toolReadThread,

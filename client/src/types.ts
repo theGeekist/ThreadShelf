@@ -197,6 +197,24 @@ export interface FilePreview {
   readonly name: string;
   readonly ok: boolean;
   readonly note?: string;
+  readonly sourcePath?: string;
+}
+
+export type IngestJobState = 'running' | 'stopped' | 'interrupted' | 'completed' | 'completed_with_errors';
+export type IngestJobFileState = 'pending' | 'running' | 'completed' | 'failed';
+
+export interface IngestJob {
+  readonly id: string;
+  readonly collection: string;
+  readonly folderPath: string;
+  readonly state: IngestJobState;
+  readonly files: readonly {
+    readonly path: string;
+    readonly state: IngestJobFileState;
+    readonly error?: string;
+  }[];
+  readonly progress?: IngestStreamEvent;
+  readonly result?: IngestResultSummary;
 }
 
 export interface RoleFilters {

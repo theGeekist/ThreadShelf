@@ -1,10 +1,10 @@
 # Getting Started
 
-This guide gets ThreadShelf running locally and indexes your first export folder. It assumes you want a private local search tool, not a hosted service.
+This guide runs ThreadShelf locally and indexes your first export folder. The archive stays on-device; Cloudflare Workers AI receives chunk text and semantic queries by default. Configure local MiniLM if you need embeddings to remain on-device.
 
-The optional llama.cpp/OpenRouter conversation continuation is a separate,
-opt-in layer. Search remains local; OpenRouter continuation is external
-and is selected through the clearly marked **OpenRouter · external** provider.
+The optional llama.cpp/OpenRouter conversation continuation is separate.
+`llama.cpp` remains local; OpenRouter continuation is external and is selected
+through the clearly marked **OpenRouter · external** provider.
 See [GENERATION.md](GENERATION.md).
 
 ## 1. Install
@@ -21,6 +21,10 @@ workspaces) and build the web UI:
 npm install
 npm run build:client
 ```
+
+Before indexing, configure the Cloudflare account ID and API token in the
+ignored root `.env`. Copy the variable names from `.env.example`. To use only
+on-device embeddings, set `THREADSHELF_EMBEDDING_PROVIDER=local` instead.
 
 ## 2. Start The App
 
@@ -207,7 +211,8 @@ npx playwright install chromium
 
 ## Troubleshooting
 
-If first ingest is slow, the local embedding model may be downloading or loading.
+If first ingest is slow, Cloudflare may be rate-limiting or the local MiniLM
+model may be downloading/loading when `THREADSHELF_EMBEDDING_PROVIDER=local`.
 
 If search returns nothing, check:
 

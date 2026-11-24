@@ -48,7 +48,10 @@ const run = async () => {
   const result = spawnSync(
     process.execPath,
     ['--import', 'tsx', '--test', ...extraArgs, ...testFiles],
-    { stdio: 'inherit' },
+    {
+      stdio: 'inherit',
+      env: { ...process.env, THREADSHELF_EMBEDDING_PROVIDER: 'local' },
+    },
   );
 
   if (result.error) {

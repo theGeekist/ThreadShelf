@@ -1,4 +1,5 @@
 #!/usr/bin/env tsx
+import './env.js';
 import { stat } from 'fs/promises';
 import { basename, resolve } from 'path';
 import { ingestFolder } from './ingest.js';

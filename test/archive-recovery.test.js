@@ -352,7 +352,7 @@ describe('durable archive and index recovery', { concurrency: false, timeout: 60
     assert.equal((await rawChunks(collection))[0].document, 'Original archived question');
   });
 
-  it('keeps old chunks on failed replacement and recovers the new archive', async (t) => {
+  it('hides a partially rebuilt file after a failed batch and recovers the new archive', async (t) => {
     const collection = 'atomic_vectors';
     await store.replaceImportedFiles(collection, [file()]);
     let fail = true;
@@ -365,7 +365,7 @@ describe('durable archive and index recovery', { concurrency: false, timeout: 60
       store.replaceImportedFiles(collection, [file([conversation('Replacement vector text')])]),
       /synthetic vector/,
     );
-    assert.equal((await rawChunks(collection))[0].document, 'Original archived question');
+    assert.deepEqual(await rawChunks(collection), []);
     assert.equal((await rawThreads(collection))[0].indexPending, 'all');
     assert.deepEqual(await store.keywordSearchCollection(collection, 'Original'), []);
     fail = false;

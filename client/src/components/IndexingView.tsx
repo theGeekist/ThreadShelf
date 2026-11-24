@@ -1,5 +1,11 @@
-import { useState, useRef, useMemo, useCallback } from 'react';
-import type { FilePreview, IngestProgress, IngestStreamEvent, StatusMessage } from '../types';
+import { useState, useRef, useMemo, useCallback, useEffect } from 'react';
+import type {
+  FilePreview,
+  IngestJob,
+  IngestProgress,
+  IngestStreamEvent,
+  StatusMessage,
+} from '../types';
 import { Icons } from '../icons';
 import { api } from '../api';
 import { collLabel, fmtTime, isPotentialExport } from '../utils';
@@ -15,7 +21,7 @@ function formatProgressStep(event: IngestStreamEvent): string {
   if (phase === 'embedding')
     return event.embeddingTotal !== undefined
       ? `Embedding ${event.embeddingDone ?? 0} / ${event.embeddingTotal} chunks`
-      : `Embedding ${done} / ${total} files`;
+      : `Embedding ${event.embeddingDone ?? 0} chunks`;
   if (event.status === 'starting') return `Starting 0 / ${total} files`;
   return `${done} / ${total} files`;
 }
@@ -126,10 +132,94 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
   const [progress, setProgress] = useState<IngestProgress | null>(null);
   const [statusMsg, setStatusMsg] = useState<StatusMessage | null>(null);
   const [preview, setPreview] = useState<FilePreview[] | null>(null);
+  const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
+  const [job, setJob] = useState<IngestJob | null>(null);
+  const [jobBusy, setJobBusy] = useState(false);
   const [newCollOpen, setNewCollOpen] = useState(false);
   const [copied, setCopied] = useState('');
   const pickerRef = useRef<HTMLInputElement>(null);
   const indexingController = useRef<AbortController | null>(null);
+  const targetCollectionRef = useRef(targetColl);
+  const draftRevision = useRef(0);
+  const draftDirty = useRef(false);
+  const restoredJobs = useRef(new Set<string>());
+
+  const refreshJob = useCallback(
+    async (signal?: AbortSignal) => {
+      const lookupCollection = targetColl;
+      const lookupRevision = draftRevision.current;
+      try {
+        const response = await api.ingestJob(lookupCollection, signal);
+        if (targetCollectionRef.current !== lookupCollection) return;
+        setJob(response.job);
+        if (
+          response.job &&
+          !restoredJobs.current.has(lookupCollection) &&
+          !draftDirty.current &&
+          draftRevision.current === lookupRevision
+        ) {
+          restoredJobs.current.add(lookupCollection);
+          setPath(response.job.folderPath);
+          setPreview(
+            response.job.files.map((file) => ({
+              name: file.path
+                .replace(/\\/g, '/')
+                .replace(`${response.job!.folderPath.replace(/\\/g, '/')}/`, ''),
+              ok: true,
+              sourcePath: file.path,
+              note: file.state === 'failed' ? 'failed' : '',
+            })),
+          );
+          setSelectedPaths(new Set(response.job.files.map((file) => file.path)));
+        }
+      } catch (e) {
+        const status =
+          typeof e === 'object' && e !== null && 'status' in e ? Number(e.status) : undefined;
+        if (!signal?.aborted && status !== 404) {
+          setStatusMsg({
+            type: 'err',
+            text: `Could not load saved indexing progress: ${e instanceof Error ? e.message : 'Unknown error'}`,
+          });
+        }
+      }
+    },
+    [targetColl],
+  );
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const load = async () => refreshJob(controller.signal);
+    void load();
+    return () => controller.abort();
+  }, [refreshJob]);
+
+  useEffect(() => {
+    if (job?.state !== 'running') return;
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = async () => {
+      try {
+        const response = await api.ingestJob(job.collection);
+        if (!active) return;
+        setJob(response.job);
+        if (response.job && response.job.state !== 'running') void onRefresh();
+      } catch (e) {
+        const status =
+          typeof e === 'object' && e !== null && 'status' in e ? Number(e.status) : undefined;
+        if (active && status !== 404)
+          setStatusMsg({
+            type: 'err',
+            text: `Progress update failed: ${e instanceof Error ? e.message : 'Unknown error'}`,
+          });
+      }
+      if (active) timer = setTimeout(() => void poll(), 1500);
+    };
+    timer = setTimeout(() => void poll(), 1000);
+    return () => {
+      active = false;
+      if (timer) clearTimeout(timer);
+    };
+  }, [job?.id, job?.collection, job?.state, onRefresh]);
 
   const copyScript = useCallback(async (file: string) => {
     try {
@@ -151,7 +241,10 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
   const applyPickedFiles = useCallback((files: readonly RelativeFile[]) => {
     if (!files.length) return;
 
+    draftRevision.current++;
+    draftDirty.current = true;
     setUploadFiles([...files]);
+    setPath('');
     const first = relativePathOf(files[0]!).replace(/\\/g, '/');
     const folder = first.split('/')[0] ?? 'folder';
     const sup = files.filter((f) => isPotentialExport(relativePathOf(f)));
@@ -160,10 +253,14 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
       files.map((f) => {
         const relPath = relativePathOf(f);
         return {
-          name: relPath.replace(/\\/g, '/').split('/').pop() ?? '',
+          name: relPath.replace(/\\/g, '/'),
           ok: isPotentialExport(relPath),
+          sourcePath: relPath,
         };
       }),
+    );
+    setSelectedPaths(
+      new Set(files.filter((f) => isPotentialExport(relativePathOf(f))).map(relativePathOf)),
     );
   }, []);
 
@@ -200,9 +297,12 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
 
   const onUsePath = useCallback(async () => {
     if (!path.trim()) return;
+    draftRevision.current++;
+    draftDirty.current = true;
     setPickedLabel('Checking…');
     try {
       const d = await api.ingestPreview(path, targetColl);
+      setUploadFiles(null);
       const duplicatePaths = new Set(d.duplicates.map((item) => item.sourceFile));
       setPickedLabel(
         `${d.files.length} export files found${
@@ -211,14 +311,20 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
       );
       setPreview(
         d.files.map((f) => {
-          const name = String(f).replace(/\\/g, '/').split('/').pop() ?? '';
+          const normalized = String(f).replace(/\\/g, '/');
+          const root = path.replace(/[\\/]+$/, '').replace(/\\/g, '/');
+          const name = normalized.startsWith(`${root}/`)
+            ? normalized.slice(root.length + 1)
+            : normalized;
           return {
             name,
             ok: true,
             note: duplicatePaths.has(f) ? 're-index' : '',
+            sourcePath: f,
           };
         }),
       );
+      setSelectedPaths(new Set(d.files));
     } catch (e) {
       setPickedLabel(`Error: ${e instanceof Error ? e.message : 'Unknown'}`);
     }
@@ -228,6 +334,11 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
     const useUpload = uploadFiles && supported.length > 0;
     let coll = targetColl;
 
+    if (useUpload && !supported.some((file) => selectedPaths.has(relativePathOf(file)))) {
+      setStatusMsg({ type: 'err', text: 'Select at least one supported file to upload.' });
+      return;
+    }
+
     if (useUpload && coll === 'chunks') {
       const first = relativePathOf(uploadFiles[0]!).replace(/\\/g, '/');
       coll = first.split('/').filter(Boolean)[0] ?? coll;
@@ -235,6 +346,82 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
 
     if (!useUpload && !path.trim()) {
       setStatusMsg({ type: 'err', text: 'Choose a folder or enter a path.' });
+      return;
+    }
+
+    if (!useUpload && !clearFirst) {
+      const selected = Array.from(selectedPaths);
+      if (!preview || selected.length === 0) {
+        setStatusMsg({
+          type: 'err',
+          text: 'Preview the folder and select at least one supported file.',
+        });
+        return;
+      }
+      setJobBusy(true);
+      setStatusMsg(null);
+      try {
+        const response = await api.startIngestJob(path, coll, selected);
+        setJob(response.job);
+        targetCollectionRef.current = coll;
+        setTargetColl(coll);
+        setStatusMsg({
+          type: 'info',
+          text: 'Indexing was accepted and will continue if you leave this page.',
+        });
+        void onRefresh();
+      } catch (e) {
+        const status =
+          typeof e === 'object' && e !== null && 'status' in e ? Number(e.status) : undefined;
+        const supportedCount = preview?.filter((file) => file.ok && file.sourcePath).length ?? 0;
+        if (status === 404 && selected.length === supportedCount) {
+          setRunning(true);
+          setProgress({ pct: 0, step: 'Starting…' });
+          setStatusMsg({
+            type: 'info',
+            text: 'Saved jobs are not available on this server yet. Using the existing indexer; this run will not resume after a reload.',
+          });
+          const controller = new AbortController();
+          indexingController.current = controller;
+          try {
+            await api.ingestPathProgress(
+              path,
+              coll,
+              false,
+              (event) => {
+                if (event.status === 'completed') {
+                  setStatusMsg({
+                    type: event.result?.errors?.length ? 'err' : 'info',
+                    text: formatCompletedMessage(event),
+                  });
+                } else if (event.status === 'error') {
+                  setStatusMsg({ type: 'err', text: `Error: ${event.error ?? 'Unknown'}` });
+                } else {
+                  setProgress(progressFromEvent(event));
+                }
+              },
+              controller.signal,
+            );
+          } catch (fallbackError) {
+            setStatusMsg({
+              type: 'err',
+              text: `Existing indexer failed: ${fallbackError instanceof Error ? fallbackError.message : 'Unknown error'}`,
+            });
+          } finally {
+            if (indexingController.current === controller) indexingController.current = null;
+            setRunning(false);
+            setProgress(null);
+            void onRefresh();
+          }
+        } else {
+          setStatusMsg({
+            type: 'err',
+            text: `Could not start saved indexing: ${e instanceof Error ? e.message : 'Unknown error'}`,
+          });
+        }
+      } finally {
+        setJobBusy(false);
+      }
       return;
     }
 
@@ -262,7 +449,13 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
 
     try {
       if (useUpload) {
-        await api.ingestUploadProgress(supported, coll, clearFirst, onProgress, controller.signal);
+        await api.ingestUploadProgress(
+          supported.filter((f) => selectedPaths.has(relativePathOf(f))),
+          coll,
+          clearFirst,
+          onProgress,
+          controller.signal,
+        );
       } else {
         await api.ingestPathProgress(path, coll, clearFirst, onProgress, controller.signal);
       }
@@ -278,7 +471,54 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
       setProgress(null);
       void onRefresh();
     }
-  }, [uploadFiles, supported, targetColl, path, clearFirst, onRefresh]);
+  }, [uploadFiles, supported, targetColl, path, clearFirst, onRefresh, selectedPaths, preview]);
+
+  const controlJob = useCallback(
+    async (action: 'stop' | 'continue') => {
+      if (!job) return;
+      setJobBusy(true);
+      setStatusMsg(null);
+      try {
+        const response =
+          action === 'stop' ? await api.stopIngestJob(job.id) : await api.continueIngestJob(job.id);
+        setJob(response.job);
+        if (action === 'continue')
+          setStatusMsg({ type: 'info', text: 'Continuing the saved indexing job.' });
+        void onRefresh();
+      } catch (e) {
+        setStatusMsg({
+          type: 'err',
+          text: `Could not ${action} indexing: ${e instanceof Error ? e.message : 'Unknown error'}`,
+        });
+      } finally {
+        setJobBusy(false);
+      }
+    },
+    [job, onRefresh],
+  );
+
+  const togglePath = (filePath: string) => {
+    setSelectedPaths((current) => {
+      const next = new Set(current);
+      if (next.has(filePath)) next.delete(filePath);
+      else next.add(filePath);
+      return next;
+    });
+  };
+
+  const selectablePreview = preview?.filter((file) => file.ok && file.sourcePath) ?? [];
+  const selectionLocked = clearFirst && !uploadFiles;
+  const allPreviewSelected =
+    selectablePreview.length > 0 &&
+    selectablePreview.every((file) => selectedPaths.has(file.sourcePath!));
+  const jobFileCounts = job?.files.reduce(
+    (counts, file) => {
+      counts[file.state] = (counts[file.state] ?? 0) + 1;
+      return counts;
+    },
+    {} as Record<string, number>,
+  );
+  const jobProgress = job?.progress;
 
   const realCollections = collections.filter((c) => c !== 'all');
 
@@ -287,7 +527,8 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
       <div className="section-h">
         <h2>Index a folder</h2>
         <span className="desc">
-          Local parse → chunk → embed → write to LanceDB. Your chat data stays on this machine.
+          Parsing and LanceDB stay local. Embeddings are sent to Cloudflare by default; set
+          <code>THREADSHELF_EMBEDDING_PROVIDER=local</code> to keep embedding inference on-device.
         </span>
       </div>
 
@@ -420,7 +661,11 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
           <input
             type="text"
             value={path}
-            onChange={(e) => setPath(e.target.value)}
+            onChange={(e) => {
+              draftRevision.current++;
+              draftDirty.current = true;
+              setPath(e.target.value);
+            }}
             placeholder="/absolute/path/to/exports"
           />
           <button className="btn" onClick={onUsePath} disabled={!path}>
@@ -434,7 +679,11 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
         <select
           id="targetCollectionSelect"
           value={targetColl}
-          onChange={(e) => setTargetColl(e.target.value)}
+          onChange={(e) => {
+            draftRevision.current++;
+            targetCollectionRef.current = e.target.value;
+            setTargetColl(e.target.value);
+          }}
           className="btn sm"
           style={{ padding: '0 8px', background: 'var(--bg-2)' }}
         >
@@ -460,8 +709,17 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
           />{' '}
           Clear collection first
         </label>
-        <button id="ingestBtn" className="btn primary" onClick={doIndex} disabled={running}>
-          {Icons.zap} {running ? 'Indexing…' : 'Index folder'}
+        {selectionLocked && (
+          <span className="desc">Every supported file in the folder will be replaced.</span>
+        )}
+        <button
+          id="ingestBtn"
+          className="btn primary"
+          onClick={doIndex}
+          disabled={running || jobBusy || job?.state === 'running'}
+        >
+          {Icons.zap}{' '}
+          {running || jobBusy || job?.state === 'running' ? 'Indexing…' : 'Index folder'}
         </button>
         {running && (
           <button
@@ -479,17 +737,37 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
           <div className="panel-head">
             <h3>Ingest preview</h3>
             <span className="sub">
-              {preview.filter((f) => f.ok).length} ok · {preview.filter((f) => !f.ok).length}{' '}
+              {selectionLocked ? 'Whole folder' : `${selectedPaths.size} selected`} ·{' '}
+              {preview.filter((f) => f.ok).length} supported · {preview.filter((f) => !f.ok).length}{' '}
               skipped
             </span>
           </div>
+          {selectablePreview.length > 0 && (
+            <label className="preview-select-all">
+              <input
+                type="checkbox"
+                disabled={selectionLocked}
+                checked={allPreviewSelected}
+                onChange={() =>
+                  setSelectedPaths(
+                    allPreviewSelected
+                      ? new Set()
+                      : new Set(selectablePreview.map((f) => f.sourcePath!)),
+                  )
+                }
+              />{' '}
+              {selectionLocked
+                ? 'Clear collection uses the whole folder'
+                : 'Select all supported files'}
+            </label>
+          )}
           <div style={{ maxHeight: 260, overflow: 'auto' }}>
-            {preview.slice(0, 60).map((f, i) => (
+            {preview.map((f, i) => (
               <div
                 key={i}
                 style={{
                   display: 'grid',
-                  gridTemplateColumns: '20px 1fr auto',
+                  gridTemplateColumns: '20px 20px 1fr auto',
                   alignItems: 'center',
                   gap: 8,
                   padding: '6px 14px',
@@ -497,6 +775,13 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
                   fontSize: 12,
                 }}
               >
+                <input
+                  type="checkbox"
+                  aria-label={`Select ${f.name}`}
+                  disabled={!f.ok || !f.sourcePath || selectionLocked}
+                  checked={!!f.sourcePath && selectedPaths.has(f.sourcePath)}
+                  onChange={() => f.sourcePath && togglePath(f.sourcePath)}
+                />
                 <span style={{ color: f.ok ? 'var(--success)' : 'var(--text-4)' }}>
                   {f.ok ? Icons.check : '·'}
                 </span>
@@ -546,6 +831,87 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
         </div>
       )}
 
+      {job && (
+        <div className="panel saved-job-panel" aria-live="polite">
+          <div className="panel-head">
+            <h3>Saved indexing job</h3>
+            <span className={`job-state ${job.state}`}>{job.state.replace(/_/g, ' ')}</span>
+          </div>
+          <div className="job-meta">
+            <span>{job.collection}</span>
+            <code title={job.folderPath}>{job.folderPath}</code>
+          </div>
+          {jobProgress && (
+            <div className="job-progress">
+              <div className="progress-head">
+                <span className="step">
+                  <b>{formatProgressStep(jobProgress)}</b>
+                </span>
+                <span className="pct">{Math.round(jobProgress.progressPercent ?? 0)}%</span>
+              </div>
+              <div className="progress-bar-new">
+                <i
+                  style={{
+                    width: `${Math.max(0, Math.min(100, jobProgress.progressPercent ?? 0))}%`,
+                  }}
+                />
+              </div>
+            </div>
+          )}
+          <div className="job-meta">
+            Files: <strong>{job.files.length} accepted</strong>
+            <span>{jobFileCounts?.completed ?? 0} completed</span>
+            <span>{jobFileCounts?.failed ?? 0} failed</span>
+            <span>{jobFileCounts?.pending ?? 0} pending</span>
+          </div>
+          {(job.state === 'interrupted' || job.state === 'stopped') && (
+            <p className="job-note">
+              Saved progress is available. Continue retries unfinished files and keeps completed
+              work.
+            </p>
+          )}
+          {job.state === 'completed_with_errors' && (
+            <p className="job-note">
+              The job finished with file failures. Review the file list below or retry the failed
+              files.
+            </p>
+          )}
+          {(job.state === 'interrupted' ||
+            job.state === 'stopped' ||
+            job.state === 'completed_with_errors') && (
+            <button
+              className="btn primary"
+              disabled={jobBusy}
+              onClick={() => void controlJob('continue')}
+            >
+              {Icons.arrowRight} Continue
+            </button>
+          )}
+          {job.state === 'running' && (
+            <button
+              className="btn danger"
+              disabled={jobBusy}
+              onClick={() => void controlJob('stop')}
+            >
+              Pause indexing
+            </button>
+          )}
+          <div className="job-files">
+            {job.files.map((file) => (
+              <div key={file.path} className="job-file">
+                <span className={`file-state ${file.state}`}>{file.state}</span>
+                <code title={file.path}>{file.path}</code>
+                {file.error && (
+                  <span className="file-error" title={file.error}>
+                    {file.error}
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {statusMsg && (
         <div id="ingestStatus" className={`banner ${statusMsg.type}`}>
           <span className="ico">{statusMsg.type === 'err' ? Icons.warn : Icons.check}</span>
@@ -558,6 +924,8 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
           open
           onClose={() => setNewCollOpen(false)}
           onCreated={(name) => {
+            draftRevision.current++;
+            targetCollectionRef.current = name;
             setTargetColl(name);
             void onRefresh();
           }}

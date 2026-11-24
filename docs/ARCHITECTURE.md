@@ -1,10 +1,13 @@
 # Architecture
 
 ThreadShelf is intentionally small: one Node.js server, reusable core modules,
-local embedding, local vector storage, and a React browser UI.
+Cloudflare BGE-M3 embeddings by default (or local MiniLM), local vector storage,
+and a React browser UI.
 
 Conversation generation is an optional layer on top of the archive. The
-`llama.cpp` path is local; the explicitly selected OpenRouter path is external.
+`llama.cpp` path is local; OpenRouter and the default Cloudflare embedding
+provider send the configured request content off-device. Local MiniLM remains
+available through explicit configuration.
 
 ## High-Level Flow
 
@@ -13,7 +16,7 @@ Export folder
   -> src/ingest.ts
   -> src/parser.ts
   -> src/chunking.ts
-  -> src/embedding.ts
+  -> src/embedding.ts (Cloudflare BGE-M3 by default; optional local MiniLM)
   -> src/store.ts
   -> LanceDB
   -> src/server.ts API
@@ -80,24 +83,42 @@ Native chat tool call -> write policy + vault boundary -> create/edit OR browser
   retain their locally continued branch. Rewritten positional keys fork safely.
 - Files that parse to zero conversations are skipped (reported in `skippedFiles`)
   and never remove archived rows, including in watch mode.
-- `clearFirst` stages the complete folder before publication. Invalid or empty
-  files, embedding failures, or cancellation before the archive commit preserve
-  the previous collection and report `replacementSkipped`; staging requires
-  memory proportional to the folder. Progress events carry per-batch
-  `embeddingDone`/`embeddingTotal` and `progressPercent`.
+- `clearFirst` parses and validates the complete folder before publication.
+  Invalid or empty files, or cancellation before the archive commit, preserve
+  the previous collection and report `replacementSkipped`. After publication,
+  the reset marker hides the collection while vectors are streamed in batches;
+  interruption leaves a durable recovery job. Parsed turns are still staged in
+  memory for `clearFirst`, while chunk and vector memory is bounded by the model
+  batch limits. Progress reports committed chunk batches.
 
 Archive/index recovery (`src/store.ts`):
 
-- Replacements use atomic LanceDB merges, rather than separate delete/add calls.
-- Archive turns and their `indexPending` job commit together. The index is a
+- Every durable indexing job follows `src/index-ledger.ts`: collection, model,
+  method and scope define its identity; cursor, completion, attempts, retry time,
+  error and update time define its state. Normal indexing persists these fields
+  with `__threads` (pending status represents completion, and whole-scope
+  rebuilds restart at cursor zero); full re-embedding stores batch cursors in
+  the destination sidecar. These are storage adapters for one ledger model, so
+  jobs remain distinct across collections, embedding models and indexing
+  methods.
+- Archive turns and their pending ledger state commit together. The index is a
   recoverable projection: `local` refreshes locally authored chunks, `all`
   rebuilds a file, `delete` removes a tombstone, and `reset` rebuilds a collection.
-- Embedding runs outside the global `__threads` lock. Writers take a snapshot,
-  embed, then re-read the scope under the lock and commit only if it is unchanged
-  (up to 3 attempts), so imports never block unrelated chat saves.
+- Embedding runs outside the global `__threads` lock. A lazy chunk iterator uses
+  the active embedding tokenizer and context limit to split overlong chunks.
+  Object-mode stream buffers are bounded; each model batch is limited by
+  `EMBED_BATCH_SIZE` and the padded-token budget `EMBED_BATCH_TOKEN_BUDGET`.
+  Inference can overlap LanceDB writes, with ordinary stream backpressure only
+  when the storage sink falls behind. The pending marker hides the affected file
+  or collection until every batch is committed. Writers re-read the archive under
+  the lock before acknowledging and retry if it changed, so imports never block
+  unrelated chat saves.
+- If a batch fails or indexing is interrupted after publication, some vectors
+  may have been deleted or committed. The durable pending marker keeps that
+  scope out of search while recovery rebuilds it from archived turns.
 - A disconnect after archive publication does not interrupt the index commit.
-  An index failure retains the durable job with `indexAttempts`, `indexRetryAt`
-  and `indexError`; workers in the HTTP server, MCP server and CLIs retry with
+  An index failure retains the durable job with its attempts, retry time and
+  last error; workers in the HTTP server, MCP server and CLIs retry with
   15 s–1 h backoff and pause after 8 failures until the thread is edited.
   Undecodable rows are marked `invalid`, keep their raw data, and are excluded
   from search without hiding healthy conversations. Full replacements stay out
@@ -126,7 +147,10 @@ Archive/index recovery (`src/store.ts`):
 
 `src/embedding.ts`
 
-- Loads the local multilingual Xenova embedding model.
+- Uses Cloudflare BGE-M3 by default or the local multilingual Xenova model when
+  configured.
+- Exposes the active tokenizer and context bound so ingestion avoids silent
+  truncation and sizes padded model batches by token slots.
 - Produces vectors for chunks and search queries.
 
 `src/store.ts`
@@ -269,13 +293,15 @@ by the user.
 
 ## Embeddings
 
-The app uses:
-
-```text
-Xenova/paraphrase-multilingual-MiniLM-L12-v2
-```
-
-This is a local multilingual model. The first run may be slower because model files need to download/cache.
+Semantic indexing and search use Cloudflare Workers AI with BAAI BGE-M3 by
+default. Text chunks and semantic queries are sent to the configured
+OpenAI-compatible embeddings endpoint. Set
+`THREADSHELF_EMBEDDING_PROVIDER=local` to use the local multilingual model
+`Xenova/paraphrase-multilingual-MiniLM-L12-v2`; its files are downloaded and
+cached on first use. The two models produce different vector spaces. ThreadShelf
+checks each collection's stored model and dimension before indexing or search.
+See [Cloudflare embeddings](CLOUDFLARE_EMBEDDINGS.md) for privacy, configuration,
+and migration details.
 
 ## API Surface
 

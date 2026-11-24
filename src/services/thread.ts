@@ -1,4 +1,4 @@
-import { readFile } from 'fs/promises';
+import { open, readFile } from 'node:fs/promises';
 import { parseExport, getConversationFromExport } from '../parser.js';
 import { getStoredThreads, listSourceFilesInCollection, type StoredThreadRow } from '../store.js';
 import { validateTurns, type Turn } from '../validation.js';
@@ -115,6 +115,7 @@ const loadThreadFromSourceFile = async (
   sourceFile: string,
   collection: string,
   conversationKey?: string,
+  maxSourceBytes?: number,
 ): Promise<ThreadResult> => {
   const allowedFiles =
     collection === 'all'
@@ -129,8 +130,12 @@ const loadThreadFromSourceFile = async (
 
   let raw: string;
   try {
-    raw = await readFile(sourceFile, 'utf-8');
-  } catch {
+    raw =
+      maxSourceBytes === undefined
+        ? await readFile(sourceFile, 'utf-8')
+        : await readSourceFileBounded(sourceFile, maxSourceBytes);
+  } catch (error) {
+    if (error instanceof BadRequestError) throw error;
     throw new NotFoundError(
       'Source file is no longer readable and this collection predates stored threads — re-index to restore thread view',
     );
@@ -157,14 +162,44 @@ const loadThreadFromSourceFile = async (
   };
 };
 
+const readSourceFileBounded = async (sourceFile: string, maxBytes: number): Promise<string> => {
+  const file = await open(sourceFile, 'r');
+  try {
+    if ((await file.stat()).size > maxBytes) {
+      throw new BadRequestError(
+        `Source file exceeds the ${Math.floor(maxBytes / 1024 / 1024)} MiB limit`,
+      );
+    }
+    const chunkSize = 64 * 1024;
+    const chunks: Buffer[] = [];
+    let total = 0;
+    while (total <= maxBytes) {
+      const buffer = Buffer.allocUnsafe(Math.min(chunkSize, maxBytes + 1 - total));
+      const { bytesRead } = await file.read(buffer, 0, buffer.length, total);
+      if (!bytesRead) break;
+      chunks.push(buffer.subarray(0, bytesRead));
+      total += bytesRead;
+    }
+    if (total > maxBytes) {
+      throw new BadRequestError(
+        `Source file exceeds the ${Math.floor(maxBytes / 1024 / 1024)} MiB limit`,
+      );
+    }
+    return Buffer.concat(chunks).toString('utf8');
+  } finally {
+    await file.close();
+  }
+};
+
 export const loadThread = async (
   sourceFile: string,
   collection: string,
   conversationKey?: string,
+  options: { readonly maxSourceBytes?: number } = {},
 ): Promise<ThreadResult> => {
   const stored = await loadStoredThread(sourceFile, collection, conversationKey);
   if (stored) return stored;
-  return loadThreadFromSourceFile(sourceFile, collection, conversationKey);
+  return loadThreadFromSourceFile(sourceFile, collection, conversationKey, options.maxSourceBytes);
 };
 
 export class NotFoundError extends Error {
