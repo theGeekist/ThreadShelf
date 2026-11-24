@@ -2,6 +2,7 @@ import {
   searchCollection,
   keywordSearchCollection,
   keywordResultComparator,
+  assertCollectionIndexProfile,
   type SearchResult,
   type SearchOptions,
 } from '../store.js';
@@ -25,13 +26,14 @@ export const searchAcrossCollections = async (
     return keywordSearchAcrossCollections(query, collection, { ...opts, n });
   }
 
-  // Generate the query vector once. "All collections" used to repeat the
-  // exact same model inference for every collection, multiplying latency as a
-  // user's archive grew.
+  const collections = collection === 'all' ? await getAllCollections() : [collection];
+  await Promise.all(collections.map((name) => assertCollectionIndexProfile(name)));
+
+  // Validate every target before sending query text to a remote embedding
+  // provider. Then generate the vector once for the selected collections.
   const queryEmbedding = await embedOne(query);
 
   if (collection === 'all') {
-    const collections = await getAllCollections();
     const merged = await Promise.all(
       collections.map(async (name) => {
         const rows = await searchCollection(name, query, { ...opts, n }, queryEmbedding);

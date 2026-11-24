@@ -518,7 +518,7 @@ export function SearchPage() {
                 type="button"
                 className="mode-btn"
                 data-on={searchMode === 'semantic'}
-                title="Rank by meaning (local embeddings)"
+                title="Rank by meaning. Cloudflare receives the query by default; local MiniLM is configurable."
                 onClick={() => switchMode('semantic')}
               >
                 Semantic

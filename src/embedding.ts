@@ -26,6 +26,11 @@ type Pipeline = ((
 
 const MODEL = 'Xenova/paraphrase-multilingual-MiniLM-L12-v2';
 const DIMENSION = 384;
+export const LOCAL_EMBEDDING_MODEL_IDENTITY = JSON.stringify({
+  provider: 'local',
+  model: MODEL,
+  dimension: DIMENSION,
+});
 let loadedPipeline: Promise<Pipeline> | undefined;
 
 export const getDimension = (): number => {
@@ -47,7 +52,7 @@ export const getEmbeddingModelIdentity = (): string =>
         dimension: getCloudflareEmbeddingDimension(),
         maxInputTokens: getCloudflareMaxInputTokens(),
       })
-    : JSON.stringify({ provider: 'local', model: MODEL, dimension: DIMENSION });
+    : LOCAL_EMBEDDING_MODEL_IDENTITY;
 
 const loadPipeline = async (): Promise<Pipeline> => {
   const { env, pipeline } = await import('@huggingface/transformers');

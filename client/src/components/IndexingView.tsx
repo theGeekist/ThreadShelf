@@ -498,7 +498,8 @@ export function IndexingView({ collections, onRefresh }: IndexingViewProps) {
       <div className="section-h">
         <h2>Index a folder</h2>
         <span className="desc">
-          Local parse → chunk → embed → write to LanceDB. Your chat data stays on this machine.
+          Parsing and LanceDB stay local. Embeddings are sent to Cloudflare by default; set
+          <code>THREADSHELF_EMBEDDING_PROVIDER=local</code> to keep embedding inference on-device.
         </span>
       </div>
 

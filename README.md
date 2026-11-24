@@ -873,6 +873,7 @@ local network** in the Local model API settings instead; see
 
 - [Getting Started](docs/GETTING_STARTED.md) — install, run, index, search.
 - [Architecture](docs/ARCHITECTURE.md) — data flow, modules, storage, API.
+- [Cloudflare embeddings](docs/CLOUDFLARE_EMBEDDINGS.md) — provider privacy, index compatibility, and resumable migration.
 - [MCP Setup](docs/MCP.md) — run the stdio MCP server and what it exposes.
 - [OpenRouter Export](docs/OPENROUTER.md) — the browser export flow + limitations.
 - [Conversation generation](docs/GENERATION.md) — llama.cpp/OpenRouter setup, privacy, and API.

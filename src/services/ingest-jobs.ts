@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, chmod, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, chmod, rm, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { dataPath } from '../paths.js';
 import { ingestFiles, listExportFiles, type IngestResult, type ProgressEvent } from '../ingest.js';
@@ -30,23 +30,47 @@ let loadPromise: Promise<void> | undefined;
 let writes = Promise.resolve();
 let startingJob = false;
 
+class JobPersistenceError extends Error {
+  constructor(cause: unknown) {
+    super('Could not persist indexing job state', { cause });
+    this.name = 'JobPersistenceError';
+  }
+}
+
 const storagePath = (): string =>
   resolve(process.env.INGEST_JOBS_PATH?.trim() || dataPath('ingestJobs'));
 
-const persist = async (): Promise<void> => {
-  const snapshot = JSON.stringify(jobs ?? {});
+const persist = async (snapshot: StoredJobs): Promise<void> => {
   const path = storagePath();
   const tempPath = `${path}.${randomUUID()}.tmp`;
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  await writeFile(tempPath, snapshot, { mode: 0o600 });
-  await chmod(tempPath, 0o600);
-  await rename(tempPath, path);
+  try {
+    await writeFile(tempPath, JSON.stringify(snapshot), { mode: 0o600 });
+    await chmod(tempPath, 0o600);
+    await rename(tempPath, path);
+  } catch (error) {
+    await rm(tempPath, { force: true }).catch(() => {});
+    throw error;
+  }
 };
 
 const save = async (job: IngestJob): Promise<void> => {
-  jobs![job.collection] = job;
-  writes = writes.catch(() => {}).then(persist);
-  await writes;
+  const operation = writes
+    .catch(() => {})
+    .then(async () => {
+      const next = { ...jobs!, [job.collection]: job };
+      try {
+        await persist(next);
+      } catch (error) {
+        throw new JobPersistenceError(error);
+      }
+      jobs = next;
+    });
+  writes = operation.then(
+    () => {},
+    () => {},
+  );
+  await operation;
 };
 
 const load = async (): Promise<void> => {
@@ -73,7 +97,7 @@ const load = async (): Promise<void> => {
           };
         }
       }
-      if (Object.values(jobs).some((job) => job.state === 'interrupted')) await persist();
+      if (Object.values(jobs).some((job) => job.state === 'interrupted')) await persist(jobs);
     })();
   }
   await loadPromise;
@@ -159,6 +183,7 @@ const runJob = async (id: string): Promise<void> => {
         await save(latest);
         job = latest;
       } catch (error) {
+        if (error instanceof JobPersistenceError) throw error;
         if (controller.signal.aborted) break;
         const active = jobs![job.collection]!;
         const message = error instanceof Error ? error.message : String(error);
@@ -174,30 +199,56 @@ const runJob = async (id: string): Promise<void> => {
       }
     }
   } finally {
-    const job = await requireJob(id);
-    const stopped = controller.signal.aborted;
-    const files = job.files.map((file) =>
-      file.state === 'running'
+    try {
+      const job = await requireJob(id);
+      const stopped = controller.signal.aborted;
+      const files = job.files.map((file) =>
+        file.state === 'running'
+          ? {
+              path: file.path,
+              state: stopped ? ('pending' as const) : ('failed' as const),
+              ...(!stopped ? { error: 'Indexing ended before this file completed' } : {}),
+            }
+          : file,
+      );
+      const state: IngestJobState = stopped
+        ? 'stopped'
+        : files.some((file) => file.state === 'pending')
+          ? 'interrupted'
+          : files.some((file) => file.state === 'failed')
+            ? 'completed_with_errors'
+            : 'completed';
+      const finalProgress = job.progress
         ? {
-            path: file.path,
-            state: stopped ? ('pending' as const) : ('failed' as const),
-            ...(!stopped ? { error: 'Indexing ended before this file completed' } : {}),
+            ...job.progress,
+            progressPercent:
+              state === 'completed' || state === 'completed_with_errors'
+                ? 100
+                : job.progress.progressPercent,
           }
-        : file,
-    );
-    const state: IngestJobState = stopped
-      ? 'stopped'
-      : files.some((file) => file.state === 'pending')
-        ? 'interrupted'
-        : files.some((file) => file.state === 'failed')
-          ? 'completed_with_errors'
-          : 'completed';
-    const finalProgress = job.progress
-      ? { ...job.progress, progressPercent: state === 'completed' || state === 'completed_with_errors' ? 100 : job.progress.progressPercent }
-      : undefined;
-    await save({ ...job, files, state, ...(finalProgress ? { progress: finalProgress } : {}) });
-    controllers.delete(id);
-    workers.delete(id);
+        : undefined;
+      try {
+        await save({ ...job, files, state, ...(finalProgress ? { progress: finalProgress } : {}) });
+      } catch (error) {
+        const current = jobs?.[job.collection];
+        if (current?.id === id) {
+          jobs = {
+            ...jobs,
+            [job.collection]: {
+              ...current,
+              state: 'interrupted',
+              files: current.files.map((file) =>
+                file.state === 'running' ? { path: file.path, state: 'pending' } : file,
+              ),
+            },
+          };
+        }
+        console.error('[ingest-job:persist]', error);
+      }
+    } finally {
+      controllers.delete(id);
+      workers.delete(id);
+    }
   }
 };
 

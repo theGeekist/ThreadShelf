@@ -14,12 +14,13 @@ process.env.LANCEDB_PATH = join(root, '.lancedb');
 const { searchCollection, keywordSearchCollection } = await import('../src/store.ts');
 
 const ROWS = 600;
-const QUERY = [1, 0];
+const DIMENSION = 384;
+const QUERY = [1, ...Array(DIMENSION - 1).fill(0)];
 // Row i sits at angle i/ROWS * 3 rad from the query, so its cosine distance
 // grows with i and the last row is the farthest one.
 const vectorAt = (i) => {
   const angle = (i / ROWS) * 3;
-  return [Math.cos(angle), Math.sin(angle)];
+  return [Math.cos(angle), Math.sin(angle), ...Array(DIMENSION - 2).fill(0)];
 };
 
 const chunk = (i, overrides = {}) => ({

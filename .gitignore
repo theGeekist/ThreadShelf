@@ -83,5 +83,7 @@ data/
 QA.md
 REVIEWS.md
 
-# Local docs directory, including links into Documents/Shared.
-/docs/
+# Local shared documents stay ignored; this source guide is intentionally tracked.
+!/docs/
+/docs/*
+!/docs/CLOUDFLARE_EMBEDDINGS.md
